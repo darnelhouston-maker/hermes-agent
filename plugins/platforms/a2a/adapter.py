@@ -28,7 +28,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
-from . import protocol, security
+from . import controller, protocol, security, work_items
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ _METHOD_TABLE = (
     ("_rpc_push_config_get", "GetTaskPushNotificationConfig", "tasks/pushNotificationConfig/get"),
     ("_rpc_push_config_list", "ListTaskPushNotificationConfigs", "tasks/pushNotificationConfig/list"),
     ("_rpc_push_config_delete", "DeleteTaskPushNotificationConfig", "tasks/pushNotificationConfig/delete"),
+    ("_rpc_work_item_read", work_items.READ_METHOD, work_items.READ_METHOD_ALIAS),
+    ("_rpc_work_item_append", work_items.APPEND_METHOD, work_items.APPEND_METHOD_ALIAS),
 )
 # JSON-RPC method -> (adapter handler name, is_v1)
 _METHODS: dict[str, tuple[str, bool]] = {
@@ -253,6 +255,21 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
         elif handler_name == "_rpc_tasks_subscribe":
             adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
+        elif handler_name in {"_rpc_work_item_read", "_rpc_work_item_append"}:
+            try:
+                result = (
+                    work_items.rpc_read(params, identity)
+                    if handler_name == "_rpc_work_item_read"
+                    else work_items.rpc_append(params, identity)
+                )
+            except work_items.WorkItemError as exc:
+                if exc.kind == "forbidden":
+                    return self._json(403, _err(req_id, protocol.ERR_UNTRUSTED_PEER, exc.safe_message))
+                code = -32062 if exc.kind == "conflict" else (
+                    -32061 if exc.kind == "unavailable" else protocol.ERR_INVALID_PARAMS
+                )
+                return self._json(200, _err(req_id, code, exc.safe_message))
+            self._json(200, _ok(req_id, result))
         else:  # plain JSON task / push-config queries
             self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
 
@@ -542,16 +559,48 @@ class A2AAdapter(BasePlatformAdapter):
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
+        try:
+            round_number = controller.reserve_round(peer, context_id)
+        except (ValueError, RuntimeError) as exc:
+            protocol.metrics.anti_loop_triggers += 1
+            return self._end_task(rec, protocol.STATE_REJECTED, str(exc))
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
+        try:
+            from .tools import _queue_telegram_trace
+
+            _queue_telegram_trace(
+                agent=peer,
+                context_id=context_id,
+                round_number=round_number,
+                direction="request",
+                body=text,
+                hub_direction="inbound",
+            )
+        except Exception:
+            logger.warning("A2A inbound owner request trace failed", exc_info=True)
         self._register_inline_push(task_id, params, agent=agent)
         if not agent.get("local", True):
             self._activate_task(task_id)
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed)
                 self._record_outcome(task_id, context_id, peer, state, reply)
+                try:
+                    from .tools import _queue_telegram_trace
+
+                    _queue_telegram_trace(
+                        agent=peer,
+                        context_id=context_id,
+                        round_number=round_number,
+                        direction="response",
+                        state=state,
+                        body=reply,
+                        hub_direction="inbound",
+                    )
+                except Exception:
+                    logger.warning("A2A inbound owner response trace failed", exc_info=True)
                 return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
             finally:
                 self._pop_pending(task_id)
@@ -569,7 +618,9 @@ class A2AAdapter(BasePlatformAdapter):
             finally:
                 self._pop_pending(task_id)
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+        return None, {"task_id": task_id, "context_id": context_id, "peer": peer,
+                      "round_number": round_number, "future": fut,
+                      "created_iso": rec["created_iso"], "started": time.time()}
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed task to another local profile via ``hermes chat``. First contact creates a
@@ -628,12 +679,27 @@ class A2AAdapter(BasePlatformAdapter):
         """Record a dispatched task's outcome; returns (state, reply) after redaction and
         input-required detection (a leading marker flags a clarification request)."""
         task_id, context_id, peer = pending["task_id"], pending["context_id"], pending["peer"]
+        round_number = pending["round_number"]
         try:
             reply = security.redact_outbound(reply or "")
             stripped = reply.lstrip()
             if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
                 state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
             self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
+            try:
+                from .tools import _queue_telegram_trace
+
+                _queue_telegram_trace(
+                    agent=peer,
+                    context_id=context_id,
+                    round_number=round_number,
+                    direction="response",
+                    state=state,
+                    body=reply,
+                    hub_direction="inbound",
+                )
+            except Exception:
+                logger.warning("A2A inbound owner response trace failed", exc_info=True)
             return state, reply
         finally:
             self._pop_pending(task_id)
