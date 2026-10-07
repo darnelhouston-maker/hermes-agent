@@ -65,6 +65,10 @@ from tools.computer_use.backend import (
 logger = logging.getLogger(__name__)
 
 _MISSING = object()
+# Serialise stdio child discovery.  Each lifecycle records the direct
+# ``cua-driver mcp`` process it created so a wedged context can terminate only
+# its own child without touching another Hermes session.
+_CUA_MCP_START_LOCK = threading.Lock()
 
 
 def _mcp_field(obj, snake: str, camel: str, default=None):
@@ -1683,6 +1687,10 @@ class _CuaDriverSession:
     session object, never the surrounding contexts.
     """
 
+    _READY_TIMEOUT_SECONDS = 30.0
+    _SHUTDOWN_GRACE_SECONDS = 5.0
+    _CANCEL_UNWIND_SECONDS = 2.0
+
     def __init__(
         self,
         bridge: _AsyncBridge,
@@ -1709,6 +1717,7 @@ class _CuaDriverSession:
         self._capability_version: str = ""
         # Lifecycle plumbing — see class docstring above.
         self._ready_event = threading.Event()
+        self._lifecycle_done_event = threading.Event()
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
@@ -1722,6 +1731,8 @@ class _CuaDriverSession:
         self._owned_standard_runtime_socket: Optional[str] = None
         self._transport_generation = 0
         self._transport_reset_callback: Optional[Any] = None
+        self._timeout_suspect = False
+        self._mcp_child_tokens: Dict[int, float] = {}
 
     def _require_started(self) -> None:
         if not self._started:
@@ -1827,6 +1838,10 @@ class _CuaDriverSession:
             # the bridge-loop thread without taking self._lock (which stop()
             # may hold while awaiting this coro's future). See #55048 Bug 1.
             self._started = False
+            # This is set only after both async context managers have unwound,
+            # so teardown can distinguish Future cancellation from the stdio
+            # transport actually releasing its cua-driver MCP child.
+            self._lifecycle_done_event.set()
 
     async def _populate_capabilities(self, session: Any) -> None:
         """Surface 4: cache per-tool capability sets + capability_version
@@ -1887,6 +1902,13 @@ class _CuaDriverSession:
             try:
                 self._start_lifecycle_locked()
             except Exception:
+                # A ready/setup failure can leave the lifecycle coroutine and
+                # its stdio child alive. Abort it before another start attempt
+                # can add a second stale MCP client to the shared daemon.
+                self._abort_lifecycle_locked(
+                    reason="startup failure",
+                    graceful_timeout=0.0,
+                )
                 self._stop_owned_standard_runtime_locked()
                 raise
             self._started = True
@@ -1896,6 +1918,7 @@ class _CuaDriverSession:
         Caller must hold self._lock."""
         # Reset per-session state.
         self._ready_event = threading.Event()
+        self._lifecycle_done_event = threading.Event()
         self._setup_error = None
         self._shutdown_event = None
         # Fire-and-forget schedule on the bridge loop. The future tracks
@@ -1904,19 +1927,32 @@ class _CuaDriverSession:
         loop = self._bridge._loop
         if loop is None:
             raise RuntimeError("cua-driver bridge not started")
-        self._lifecycle_future = asyncio.run_coroutine_threadsafe(
-            self._lifecycle_coro(), loop
-        )
-        if not self._ready_event.wait(timeout=30.0):
-            # Best-effort: signal shutdown if the future is still alive.
-            self._signal_shutdown_locked()
+        with _CUA_MCP_START_LOCK:
+            children_before = self._direct_mcp_children()
+            self._lifecycle_future = asyncio.run_coroutine_threadsafe(
+                self._lifecycle_coro(), loop
+            )
+            ready = self._ready_event.wait(timeout=self._READY_TIMEOUT_SECONDS)
+            children_after = self._direct_mcp_children()
+            self._mcp_child_tokens = {
+                pid: created
+                for pid, created in children_after.items()
+                if pid not in children_before
+            }
+            if not ready:
+                self._abort_lifecycle_locked(
+                    reason="startup ready timeout",
+                    graceful_timeout=0.0,
+                )
             # Surface which startup phase wedged (issue #57025) — "doctor
             # passes but the wrapper times out" reports are undiagnosable
             # from a bare "never reached ready".
+        if not ready:
             phase = getattr(self, "_startup_phase", "unknown")
             from hermes_constants import display_hermes_home
             raise RuntimeError(
-                "cua-driver session never reached ready (timeout 30s; "
+                "cua-driver session never reached ready "
+                f"(timeout {self._READY_TIMEOUT_SECONDS:g}s; "
                 f"stuck in phase: {phase}). "
                 "Run `hermes computer-use doctor` and check "
                 f"{display_hermes_home()}/logs/agent.log for the phase timings."
@@ -1924,16 +1960,21 @@ class _CuaDriverSession:
         # If setup failed, the lifecycle coroutine set _setup_error
         # before setting _ready_event. Re-raise it on the caller's thread.
         if self._setup_error is not None:
+            setup_error = self._setup_error
+            self._abort_lifecycle_locked(
+                reason="startup setup error",
+                graceful_timeout=0.0,
+            )
             raise RuntimeError(
-                f"cua-driver session setup failed: {self._setup_error}"
-            ) from self._setup_error
+                f"cua-driver session setup failed: {setup_error}"
+            ) from setup_error
         self._transport_generation += 1
         if self._transport_generation > 1:
             self._notify_transport_reset()
 
     def stop(self) -> None:
         with self._lock:
-            if not self._started:
+            if not self._started and self._lifecycle_future is None:
                 self._stop_owned_standard_runtime_locked()
                 return
             self._started = False
@@ -1984,21 +2025,135 @@ class _CuaDriverSession:
     def _stop_lifecycle_locked(self) -> None:
         """Signal shutdown + wait for the lifecycle coroutine to unwind.
         Caller must hold self._lock."""
+        self._abort_lifecycle_locked(
+            reason="shutdown",
+            graceful_timeout=self._SHUTDOWN_GRACE_SECONDS,
+        )
+
+    def _abort_lifecycle_locked(
+        self,
+        *,
+        reason: str,
+        graceful_timeout: float,
+    ) -> None:
+        """Bound and reap one MCP lifecycle, including a wedged startup.
+
+        Merely forgetting ``_lifecycle_future`` does not stop the coroutine or
+        the stdio child it owns. That was the stale-client leak: every failed
+        ready/restart attempt could leave one ``cua-driver mcp`` process behind.
+        Signal normal shutdown first, then cancel on deadline and wait on the
+        coroutine's actual context-unwind event for a short bounded period.
+        """
         self._signal_shutdown_locked()
         fut = self._lifecycle_future
         if fut is None:
             return
         try:
-            # 5s budget for context unwind (stdio_client teardown).
-            fut.result(timeout=5.0)
+            fut.result(timeout=max(0.0, graceful_timeout))
         except concurrent.futures.TimeoutError:
-            logger.warning("cua-driver session shutdown timed out (5s)")
+            logger.warning(
+                "cua-driver lifecycle %s exceeded %.1fs; cancelling stale MCP client",
+                reason,
+                graceful_timeout,
+            )
+            fut.cancel()
+            done = getattr(self, "_lifecycle_done_event", None)
+            if done is not None and not done.wait(timeout=self._CANCEL_UNWIND_SECONDS):
+                logger.error(
+                    "cua-driver lifecycle %s did not confirm context unwind "
+                    "within %.1fs after cancellation",
+                    reason,
+                    self._CANCEL_UNWIND_SECONDS,
+                )
+        except concurrent.futures.CancelledError:
+            pass
         except Exception as e:
             # Real shutdown errors (not the previous cancel-scope race
             # which is now structurally impossible) still get surfaced.
             logger.warning("cua-driver shutdown error: %s", e)
         finally:
+            # A context that reported completion should already have reaped
+            # its child.  Verify that invariant and clean up defensively if an
+            # SDK/platform edge left the direct child behind.
+            self._terminate_tracked_mcp_children(reason=reason)
             self._lifecycle_future = None
+
+    @staticmethod
+    def _direct_mcp_children() -> Dict[int, float]:
+        """Return direct cua-driver MCP children of this Hermes process.
+
+        ``psutil`` is a pinned core dependency.  Failures return an empty map;
+        normal Future cancellation still runs, while diagnostics report any
+        unconfirmed context unwind.
+        """
+        try:
+            import psutil
+
+            found: Dict[int, float] = {}
+            for child in psutil.Process(os.getpid()).children(recursive=False):
+                try:
+                    command = child.cmdline()
+                    if (
+                        command
+                        and "cua-driver" in os.path.basename(command[0])
+                        and "mcp" in command[1:]
+                    ):
+                        found[child.pid] = child.create_time()
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+            return found
+        except Exception:
+            logger.debug("could not inventory cua-driver MCP children", exc_info=True)
+            return {}
+
+    def _terminate_tracked_mcp_children(self, *, reason: str) -> None:
+        """Terminate only MCP children captured during this lifecycle start."""
+        tokens = dict(getattr(self, "_mcp_child_tokens", {}) or {})
+        self._mcp_child_tokens = {}
+        if not tokens:
+            return
+        try:
+            import psutil
+
+            owned = []
+            for pid, created in tokens.items():
+                try:
+                    process = psutil.Process(pid)
+                    if process.ppid() != os.getpid():
+                        continue
+                    if abs(process.create_time() - created) > 0.01:
+                        continue
+                    command = process.cmdline()
+                    if not (
+                        command
+                        and "cua-driver" in os.path.basename(command[0])
+                        and "mcp" in command[1:]
+                    ):
+                        continue
+                    process.terminate()
+                    owned.append(process)
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+            _, alive = psutil.wait_procs(owned, timeout=1.0)
+            for process in alive:
+                try:
+                    process.kill()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass
+            _, alive = psutil.wait_procs(alive, timeout=1.0)
+            if alive:
+                logger.error(
+                    "cua-driver lifecycle %s left %d owned MCP child process(es) "
+                    "after terminate/kill",
+                    reason,
+                    len(alive),
+                )
+        except Exception:
+            logger.debug(
+                "could not terminate tracked cua-driver MCP children (%s)",
+                reason,
+                exc_info=True,
+            )
 
     def _signal_shutdown_locked(self) -> None:
         """Set the asyncio shutdown event from the caller's thread."""
@@ -2187,7 +2342,7 @@ class _CuaDriverSession:
     def _restart_session_locked(self) -> None:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
-        if self._started:
+        if self._started or self._lifecycle_future is not None:
             try:
                 self._stop_lifecycle_locked()
             except Exception as e:
@@ -2881,7 +3036,11 @@ class CuaDriverBackend(ComputerUseBackend):
         # the session_end hook cua-driver registers internally.
         if self._session._started:
             try:
-                self._session.call_tool("end_session", {"session": self._session_id})
+                self._session.call_tool(
+                    "end_session",
+                    {"session": self._session_id},
+                    timeout=3.0,
+                )
             except Exception as e:
                 logger.debug("cua-driver end_session failed (continuing teardown): %s", e)
         try:
