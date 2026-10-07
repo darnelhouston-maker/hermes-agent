@@ -279,15 +279,19 @@ def test_terminal_verdict_returns_none_without_injection():
 
 
 # ---------------------------------------------------------------------------
-# The async-delegation path is unaffected
+# Async delegations retain a durable origin-chat fallback
 # ---------------------------------------------------------------------------
 
-def test_async_delegation_gate_unchanged():
-    """A stamped async_delegation event still routes through the existing
-    delegation-owned gate (terminal verdict -> None), proving the completion
-    branch did not fork or shadow the delegation policy."""
+def test_async_delegation_from_rotated_session_reaches_origin_chat():
+    """A durable result survives parent rotation and is admitted to the same
+    origin chat. Ordinary background completions remain terminal above."""
     adapter = SimpleNamespace(handle_message=AsyncMock())
-    runner = _runner(adapter, session_db=_SessionDB(None))
+    runner = _runner(
+        adapter,
+        session_db=_SessionDB(
+            {"ended_at": 1786288000.0, "end_reason": "session_reset"}
+        ),
+    )
 
     evt = {
         "type": "async_delegation",
@@ -298,8 +302,10 @@ def test_async_delegation_gate_unchanged():
     }
     result = asyncio.run(runner._deliver_completion_notification("text", evt))
 
-    assert result is None
-    adapter.handle_message.assert_not_awaited()
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    delivered_event = adapter.handle_message.await_args.args[0]
+    assert delivered_event.source.chat_id == "12345"
 
 
 # ---------------------------------------------------------------------------

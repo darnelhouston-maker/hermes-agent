@@ -3,8 +3,8 @@
 Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 
 1. Completions are pinned to the spawning session (contributor commit).
-2. A dead/ended spawning session is never resurrected: the injection is
-   dropped, fail-closed (never rerouted to the peer's current session).
+2. A dead/ended spawning session is never resurrected: a durable completion is
+   rerouted to the origin chat's current session instead of being dropped.
 3. /new interrupts the old conversation's in-flight async delegations.
 """
 
@@ -118,7 +118,7 @@ class TestGatewayPinningFailsClosed:
         )
 
     @pytest.mark.asyncio
-    async def test_non_compression_ended_parent_drops(self):
+    async def test_non_compression_ended_parent_retargets_origin_chat(self):
         current = self._entry("sess_old")
         runner = self._make_runner(
             {
@@ -134,7 +134,19 @@ class TestGatewayPinningFailsClosed:
             current, "sess_old"
         )
 
-        assert resolved is None
+        assert resolved is current
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    async def test_pruned_parent_retargets_origin_chat(self):
+        current = self._entry("sess_current")
+        runner = self._make_runner({})
+
+        resolved = await runner._resolve_async_delegation_session(
+            current, "sess-pruned"
+        )
+
+        assert resolved is current
         self._assert_no_route_change(runner)
 
 

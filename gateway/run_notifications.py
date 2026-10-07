@@ -248,9 +248,11 @@ class GatewayNotificationsMixin:
     ) -> Optional[SessionEntry]:
         """Resolve an async completion to its verified owning gateway session.
 
-        Follow compression-rotation lineage (parent row ended, child continues), but never let a
-        late completion override an unrelated /new or restored route. Unknown ownership fails
-        closed; the result stays in the delegation records.
+        Follow compression-rotation lineage while it exists. If the spawning session was removed
+        or crossed a non-compression boundary, retain the durable result by delivering it to the
+        current session for the same origin routing key. Explicit ``/new`` still interrupts live
+        delegations at reset time; this fallback covers a completion already made durable before
+        that interruption and automatic session rotation/expiry.
         """
         from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = cast(Any, self._session_db)
@@ -269,22 +271,24 @@ class GatewayNotificationsMixin:
         except Exception:
             logger.debug("Async-delegation parent lookup failed for %s", pinned_session_id, exc_info=True)
         if pinned_row is None:
-            logger.warning(
-                "Async-delegation completion has unknown spawning session %s; "
-                "dropping injection (#55578 fail-closed).", pinned_session_id,
+            logger.info(
+                "Async-delegation completion spawning session %s is no longer retained; "
+                "retargeting the durable result to the origin chat's current session %s.",
+                pinned_session_id, session_entry.session_id,
             )
-            return None
+            return session_entry
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):
             _end_reason = str(pinned_row.get("end_reason") or "")
             if _end_reason in _USER_BOUNDARY_END_REASONS:
-                logger.warning(
-                    "Async-delegation completion pinned to user-closed session %s "
-                    "(end_reason=%r); dropping injection instead of resurrecting it "
-                    "(#55578 fail-closed).", pinned_session_id, _end_reason,
+                logger.info(
+                    "Async-delegation completion pinned to closed session %s "
+                    "(end_reason=%r); retargeting the durable result to the origin "
+                    "chat's current session %s.",
+                    pinned_session_id, _end_reason, session_entry.session_id,
                 )
-                return None
+                return session_entry
             if _end_reason != "compression":
                 # Idle/timeout end (scale-to-zero norm): the chat route is still valid, so deliver to its
                 # current session rather than drop (the row would be acked then silently lost).
@@ -1403,7 +1407,9 @@ class GatewayNotificationsMixin:
                 self._completion_deliveries_inflight.add(identity)
             return seen
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(
+        self, parent_session_id: str, *, durable_origin_fallback: bool = False,
+    ) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
@@ -1418,14 +1424,19 @@ class GatewayNotificationsMixin:
             logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
         if parent is None:
-            return "terminal"
+            # Async delegations carry a durable origin routing key. Its current session can accept
+            # the result even after the historical parent row has been pruned. Plain process
+            # completions do not get this exception.
+            return "deliver" if durable_origin_fallback else "terminal"
         if not parent.get("ended_at"):
             return "deliver"
         end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
             # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
-            return "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+            if end_reason in _USER_BOUNDARY_END_REASONS and not durable_origin_fallback:
+                return "terminal"
+            return "deliver"
         try:
             tip_session_id = await session_db.get_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:
@@ -1455,7 +1466,10 @@ class GatewayNotificationsMixin:
 
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
-            verdict = await self._classify_completion_target(parent_session_id)
+            verdict = await self._classify_completion_target(
+                parent_session_id,
+                durable_origin_fallback=evt.get("type") == "async_delegation",
+            )
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
@@ -1518,7 +1532,10 @@ class GatewayNotificationsMixin:
         # can still fail closed inside the message pipeline AFTER the adapter accepted, which would falsely
         # acknowledge the durable row as delivered. Verify the target here, before acceptance, and give
         # drops an honest durable disposition.
-        verdict = await self._classify_completion_target(parent_session_id)
+        verdict = await self._classify_completion_target(
+            parent_session_id,
+            durable_origin_fallback=evt_type == "async_delegation",
+        )
         if verdict == "terminal":
             if evt_type == "async_delegation":
                 logger.warning(
