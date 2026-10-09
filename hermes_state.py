@@ -5017,15 +5017,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Corrupt FTS shadow tables make every write raise the
-                # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. Recover here,
-                # at the shared persistence boundary, so every caller gets the
-                # same guarantee. First try the cheap in-place repair. If that
-                # one-shot path is unavailable or corruption recurs, detach the
-                # derived indexes and retry against the canonical tables.
-                if self._try_runtime_fts_rebuild(exc):
-                    continue
+                # Corrupt FTS shadow tables make every write fail through the
+                # sync triggers while canonical rows remain intact. Detach the
+                # derived indexes and retry the canonical write; a live request
+                # must never run the unbounded full-index rebuild.
                 if self._enter_fts_fail_open(exc):
                     continue
                 raise
@@ -5069,22 +5064,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """True for the error class a corrupt FTS index raises on writes.
+        """True only when SQLite attributes corruption to an FTS object.
 
-        SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic ``database disk image is malformed`` (covered
-        by :func:`is_malformed_db_error`); newer builds raise the FTS5-specific
-        ``fts5: corrupt structure record for table "messages_fts"``. Both mean
-        the same thing for the write path: the canonical rows are fine, the
-        FTS shadow tables are not.  The FTS-only rebuild and fail-open
-        detach are safe here because they only touch derived indexes; if the
-        damage is actually in a canonical B-tree, the rebuild itself fails and
-        the write propagates.
+        A known SQLite result code outranks error prose. ``SQLITE_CORRUPT_VTAB``
+        is scoped to a virtual table, while bare ``SQLITE_CORRUPT`` and
+        ``SQLITE_NOTADB`` indicate structural damage and must not enter the
+        derived-index fail-open path. On runtimes without result codes, require
+        both a corruption marker and an explicit ``messages_fts*`` object.
         """
-        if is_malformed_db_error(exc):
-            return True
+        code = getattr(exc, "sqlite_errorcode", None)
+        if code is not None:
+            return code == getattr(sqlite3, "SQLITE_CORRUPT_VTAB", object())
+
         msg = str(exc).lower()
-        return "fts5" in msg and "corrupt" in msg
+        if re.search(r"\bmessages_fts\w*", msg) is None:
+            return False
+        if msg.startswith("fts5:") and "corrupt" in msg:
+            return True
+        return is_malformed_db_error(exc)
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Return foreign processes holding this DB or its WAL sidecars.
@@ -5252,68 +5249,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return signalled
 
     def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
-        """One-shot in-place FTS rebuild after a corrupt-index write failure.
+        """Compatibility hook retained for callers from mixed fleet versions.
 
-        Returns True when a rebuild was performed and the failed write should
-        be retried; False when the error isn't the FTS-corruption class, FTS
-        is disabled, or a rebuild was already attempted for this instance.
-
-        Delegates to :meth:`rebuild_fts` (the FTS5 ``'rebuild'`` command —
-        index rewritten from the canonical messages table, zero message-row
-        mutation). Safe to call from ``_execute_write``'s except path: the
-        failed transaction was rolled back and ``self._lock`` released before
-        the exception propagated, and ``rebuild_fts`` re-acquires it.
-        E2E-verified: a corrupted ``messages_fts_data`` shadow table rejects
-        every append; after the in-place rebuild the same append succeeds and
-        search works again.
+        Full-index rebuilds are offline maintenance only. Live reads and writes
+        must use :meth:`_enter_fts_fail_open` and canonical-table fallbacks.
         """
-        if self._fts_runtime_rebuild_attempted:
-            return False
-        if not self._fts_enabled:
-            return False
-        if not self._is_fts_write_corruption_error(exc):
-            return False
-        # Set the one-shot flag before the foreign-holder check: even when
-        # the rebuild is skipped, the fail-open path that follows persists
-        # the FTS_STALE_KEY marker so the next process startup will retry
-        # via _recover_stale_fts (which has its own holder guard). Setting
-        # the flag here also avoids re-running the expensive psutil scan on
-        # every subsequent corrupted write through this instance.
-        self._fts_runtime_rebuild_attempted = True
-        foreign_holders = self._foreign_state_db_holders()
-        if foreign_holders:
-            logger.warning(
-                "Skipping automatic state.db FTS rebuild while foreign "
-                "processes hold the database or WAL sidecars (%s); detaching "
-                "FTS sync so canonical writes can continue.",
-                foreign_holders,
-            )
-            return False
-        logger.warning(
-            "state.db write failed with an FTS-corruption error (%s) — "
-            "attempting one-shot in-place FTS rebuild; canonical message "
-            "rows are preserved.", exc,
-        )
-        try:
-            rebuilt = self.rebuild_fts()
-        except Exception as rebuild_exc:
-            logger.error(
-                "In-place FTS rebuild failed (%s); the database needs the "
-                "full offline repair path (repair_state_db_schema).",
-                rebuild_exc,
-            )
-            return False
-        if not rebuilt:
-            logger.error(
-                "In-place FTS rebuild made no progress; the database needs "
-                "the full offline repair path (repair_state_db_schema)."
-            )
-            return False
-        logger.warning(
-            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
-            rebuilt,
-        )
-        return True
+        return False
 
     def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue.
