@@ -2345,19 +2345,115 @@ def _replace_message_content(message: dict, content: Any) -> None:
 _PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — reload before acting on these tasks]"
 
 
-def _pruned_skill_reload_notice(compressed: list) -> str:
-    """Reload notice for skills whose bodies were pruned, or ``""``.
-    Scans ``[SKILL_PRUNED: ...]`` markers in the post-compression transcript; first-seen order, deduplicated,
-    capped at ``_MAX_PRUNED_SKILL_MARKERS``."""
+def _skill_name_aliases(name: Any) -> set[str]:
+    """Comparable spellings for one skill name.
+
+    ``skill_view`` accepts bare, category-qualified (``category/name``), and
+    plugin-qualified (``plugin:name``) names, while its successful result uses
+    the canonical frontmatter name.  Matching those spellings is safe only
+    after a real tool-call/result pair has been established.
+    """
+    value = str(name or "").strip().casefold()
+    if not value:
+        return set()
+    return {value, value.rsplit("/", 1)[-1], value.rsplit(":", 1)[-1]}
+
+
+def _same_skill_name(left: Any, right: Any) -> bool:
+    return bool(_skill_name_aliases(left) & _skill_name_aliases(right))
+
+
+def _tool_call_field(value: Any, key: str, default: Any = None) -> Any:
+    return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+
+
+def _skill_view_call(message: dict) -> list[tuple[str, str]]:
+    """Return trusted ``(call_id, requested_name)`` skill_view calls in *message*."""
+    if message.get("role") != "assistant":
+        return []
+    calls: list[tuple[str, str]] = []
+    for tool_call in message.get("tool_calls") or []:
+        function = _tool_call_field(tool_call, "function", {})
+        if _tool_call_field(function, "name") != "skill_view":
+            continue
+        arguments = _tool_call_field(function, "arguments", "")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(arguments, dict):
+            continue
+        call_id = _tool_call_field(tool_call, "id") or _tool_call_field(tool_call, "call_id")
+        name = arguments.get("name")
+        if call_id and isinstance(name, str) and name.strip():
+            calls.append((str(call_id), name.strip()))
+    return calls
+
+
+def _full_skill_view_result(message: dict, requested_name: str) -> str | None:
+    """Canonical name for a successful, full skill result; otherwise ``None``.
+
+    A matching assistant tool call is the provenance boundary.  A user/assistant
+    prose claim, a mismatched call id, a dedup stub, or malformed JSON cannot
+    clear a prune marker.
+    """
+    if message.get("role") != "tool":
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    if payload.get("dedup") is True or payload.get("content_returned") is False:
+        return None
+    body = payload.get("content")
+    canonical_name = payload.get("name")
+    if not isinstance(body, str) or not body.strip() or not isinstance(canonical_name, str):
+        return None
+    if not _same_skill_name(requested_name, canonical_name):
+        return None
+    return canonical_name
+
+
+def _unresolved_pruned_skill_names(compressed: list) -> list[str]:
+    """Pruned skills not subsequently reloaded with attributable full content.
+
+    Ordering is the freshness proof: a load before the marker is stale, while a
+    matching successful result after it resolves that marker.  If a later
+    compaction prunes the newly loaded body, its later marker re-arms the skill.
+    """
     from agent.context_compressor import _MAX_PRUNED_SKILL_MARKERS, _extract_pruned_skill_names
-    names: list = []
+
+    unresolved: list[str] = []
+    calls: dict[str, str] = {}
     for message in compressed:
         if not isinstance(message, dict):
             continue
         for name in _extract_pruned_skill_names(_message_text(message)):
-            if name not in names:
-                names.append(name)
-    del names[_MAX_PRUNED_SKILL_MARKERS:]
+            if not any(_same_skill_name(name, existing) for existing in unresolved):
+                unresolved.append(name)
+        for call_id, requested_name in _skill_view_call(message):
+            calls[call_id] = requested_name
+        if message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            requested_name = calls.get(call_id)
+            if requested_name and _full_skill_view_result(message, requested_name):
+                unresolved = [
+                    name for name in unresolved if not _same_skill_name(name, requested_name)
+                ]
+    return unresolved[:_MAX_PRUNED_SKILL_MARKERS]
+
+
+def _pruned_skill_reload_notice(compressed: list) -> str:
+    """Reload notice for skills whose bodies were pruned, or ``""``.
+    Reconciles markers against later, matching, full ``skill_view`` results;
+    unresolved names preserve first-seen order and the shared marker cap."""
+    names = _unresolved_pruned_skill_names(compressed)
     if not names:
         return ""
     calls = "; ".join(f"skill_view(name='{name}')" for name in names)

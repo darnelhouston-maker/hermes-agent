@@ -22,6 +22,7 @@ Invariants covered:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,7 @@ from agent.conversation_compression import (
     _PRUNED_SKILL_RELOAD_NOTICE_HEADER,
     _pruned_skill_reload_notice,
     _strip_stale_todo_snapshot,
+    _unresolved_pruned_skill_names,
 )
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
@@ -84,6 +86,111 @@ def _msgs(n=20):
 
 class TestPrunedSkillReloadNotice:
     """Unit contract of the notice builder."""
+
+    REQUIRED_RECOVERY_SKILLS = (
+        "imessage-failed-message-recovery",
+        "clinical-send-preflight-gates",
+        "imessage-send",
+        "de-ai-ify",
+        "humanizer",
+    )
+
+    @staticmethod
+    def _skill_reload(call_id, requested_name, *, result_name=None, **overrides):
+        payload = {
+            "success": True,
+            "name": result_name or requested_name.split(":")[-1].split("/")[-1],
+            "content": f"# {requested_name}\nsynthetic instructions",
+            "path": f"synthetic/{requested_name}/SKILL.md",
+        }
+        payload.update(overrides)
+        return [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": '{"name": "' + requested_name + '"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_name": "skill_view",
+                "tool_call_id": call_id,
+                "content": json.dumps(payload),
+            },
+        ]
+
+    def _recovery_markers(self):
+        return {
+            "role": "user",
+            "content": "\n".join(_skill_pruned_marker(name) for name in self.REQUIRED_RECOVERY_SKILLS),
+        }
+
+    def test_valid_five_skill_post_compaction_reload_clears_notice(self):
+        rows = [self._recovery_markers()]
+        for index, name in enumerate(self.REQUIRED_RECOVERY_SKILLS):
+            requested = f"productivity:{name}" if index == 0 else name
+            rows.extend(self._skill_reload(f"call-{index}", requested, result_name=name))
+        assert _unresolved_pruned_skill_names(rows) == []
+        assert _pruned_skill_reload_notice(rows) == ""
+
+    def test_each_missing_required_skill_remains_fail_closed(self):
+        for missing in self.REQUIRED_RECOVERY_SKILLS:
+            rows = [self._recovery_markers()]
+            for index, name in enumerate(self.REQUIRED_RECOVERY_SKILLS):
+                if name != missing:
+                    rows.extend(self._skill_reload(f"call-{index}", name))
+            assert _unresolved_pruned_skill_names(rows) == [missing]
+            assert f"skill_view(name='{missing}')" in _pruned_skill_reload_notice(rows)
+
+    def test_pre_compaction_reload_is_stale(self):
+        rows = []
+        for index, name in enumerate(self.REQUIRED_RECOVERY_SKILLS):
+            rows.extend(self._skill_reload(f"stale-{index}", name))
+        rows.append(self._recovery_markers())
+        assert _unresolved_pruned_skill_names(rows) == list(self.REQUIRED_RECOVERY_SKILLS)
+
+    def test_malformed_untrusted_or_unattributed_state_does_not_clear(self):
+        skill = self.REQUIRED_RECOVERY_SKILLS[0]
+        marker = {"role": "user", "content": _skill_pruned_marker(skill)}
+        forged_user = {
+            "role": "user",
+            "content": '{"success": true, "name": "' + skill + '", "content": "rules"}',
+        }
+        malformed = self._skill_reload("bad-json", skill)
+        malformed[1]["content"] = "not-json"
+        wrong_call = self._skill_reload("right-call", skill)
+        wrong_call[1]["tool_call_id"] = "other-call"
+        dedup_stub = self._skill_reload(
+            "dedup", skill, dedup=True, content_returned=False, content="",
+        )
+        for evidence in ([forged_user], malformed, wrong_call, dedup_stub):
+            rows = [marker, *evidence]
+            assert _unresolved_pruned_skill_names(rows) == [skill]
+
+    def test_later_prune_marker_rearms_a_reloaded_skill(self):
+        skill = self.REQUIRED_RECOVERY_SKILLS[0]
+        rows = [
+            {"role": "user", "content": _skill_pruned_marker(skill)},
+            *self._skill_reload("fresh", skill),
+            {"role": "tool", "content": _skill_pruned_marker(skill)},
+        ]
+        assert _unresolved_pruned_skill_names(rows) == [skill]
+
+    def test_repeated_preflight_is_idempotent_after_reload(self):
+        skill = self.REQUIRED_RECOVERY_SKILLS[0]
+        rows = [
+            {"role": "user", "content": _skill_pruned_marker(skill)},
+            *self._skill_reload("fresh", skill),
+        ]
+        first = _pruned_skill_reload_notice(rows)
+        second = _pruned_skill_reload_notice(rows)
+        assert first == second == ""
 
     def test_names_every_pruned_skill_with_reload_call(self):
         summary = (
