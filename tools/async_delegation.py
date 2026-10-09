@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -89,6 +90,32 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_SCHEMA_LOCK = threading.Lock()
+_INITIALIZED_DB_PATHS: set[str] = set()
+
+_ASYNC_DB_FILENAME = "async_delegations.db"
+_LEGACY_MIGRATION_KEY = "legacy_state_db_v1"
+_ASYNC_COLUMNS = (
+    "delegation_id",
+    "origin_session",
+    "origin_ui_session_id",
+    "parent_session_id",
+    "state",
+    "dispatched_at",
+    "completed_at",
+    "updated_at",
+    "event_json",
+    "result_json",
+    "delivery_state",
+    "delivery_attempts",
+    "delivered_at",
+    "owner_pid",
+    "owner_started_at",
+    "task_json",
+    "delivery_claim",
+    "delivery_claimed_at",
+    "origin_session_id",
+)
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -122,15 +149,44 @@ _monitor_stop = threading.Event()
 
 
 def _db_path():
+    """Return the isolated high-churn delegation registry path."""
+    return get_hermes_home() / _ASYNC_DB_FILENAME
+
+
+def _legacy_db_path():
     return get_hermes_home() / "state.db"
+
+
+def _secure_registry_files(path, *, create_main: bool = False) -> None:
+    """Keep the dedicated registry and SQLite sidecars owner-only."""
+    if create_main and not path.exists():
+        fd = os.open(path, os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(fd)
+    for candidate in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        if candidate.exists():
+            try:
+                candidate.chmod(0o600)
+            except OSError:
+                # Windows does not implement POSIX mode bits. Its ACL remains
+                # authoritative; failure to chmod must not hide a valid DB.
+                if os.name != "nt":
+                    raise
 
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _secure_registry_files(path, create_main=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
-        _initialize_schema(conn)
+        _configure_connection(conn)
+        path_key = str(path.resolve())
+        if path_key not in _INITIALIZED_DB_PATHS:
+            with _SCHEMA_LOCK:
+                if path_key not in _INITIALIZED_DB_PATHS:
+                    _initialize_schema(conn)
+                    _INITIALIZED_DB_PATHS.add(path_key)
+        _secure_registry_files(path)
     except Exception:
         # A PRAGMA/DDL failure after a successful connect() must not leak the
         # just-opened connection back to the caller.
@@ -139,10 +195,15 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def _configure_connection(conn: sqlite3.Connection) -> None:
     from hermes_state import apply_wal_with_fallback
 
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    apply_wal_with_fallback(conn, db_label=_ASYNC_DB_FILENAME)
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -181,6 +242,128 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegation_store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )"""
+    )
+    conn.commit()
+    _migrate_legacy_registry(conn)
+
+    result = conn.execute("PRAGMA quick_check").fetchall()
+    if result != [("ok",)]:
+        raise sqlite3.DatabaseError(
+            "async delegation registry failed SQLite quick_check"
+        )
+
+
+def _migrate_legacy_registry(conn: sqlite3.Connection) -> None:
+    """Copy the old shared-state registry once and retain it for rollback."""
+    marker = conn.execute(
+        "SELECT value FROM async_delegation_store_meta WHERE key=?",
+        (_LEGACY_MIGRATION_KEY,),
+    ).fetchone()
+    if marker is not None:
+        return
+
+    legacy_path = _legacy_db_path()
+    rows: List[tuple] = []
+    source = "absent"
+    if legacy_path.exists() and legacy_path.resolve() != _db_path().resolve():
+        legacy_uri = legacy_path.resolve().as_uri() + "?mode=ro"
+        legacy = sqlite3.connect(legacy_uri, uri=True, timeout=10)
+        try:
+            table = legacy.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='async_delegations'"
+            ).fetchone()
+            if table is not None:
+                legacy_columns = {
+                    row[1]
+                    for row in legacy.execute(
+                        "PRAGMA table_info(async_delegations)"
+                    )
+                }
+                if "delegation_id" not in legacy_columns:
+                    raise sqlite3.DatabaseError(
+                        "legacy async delegation registry has no delegation_id"
+                    )
+                defaults = {
+                    "origin_session": "''",
+                    "origin_ui_session_id": "''",
+                    "parent_session_id": "NULL",
+                    "state": "'unknown'",
+                    "dispatched_at": "0",
+                    "completed_at": "NULL",
+                    "updated_at": "0",
+                    "event_json": "NULL",
+                    "result_json": "NULL",
+                    "delivery_state": "'pending'",
+                    "delivery_attempts": "0",
+                    "delivered_at": "NULL",
+                    "owner_pid": "NULL",
+                    "owner_started_at": "NULL",
+                    "task_json": "NULL",
+                    "delivery_claim": "NULL",
+                    "delivery_claimed_at": "NULL",
+                    "origin_session_id": "''",
+                }
+                required_defaults = {
+                    "origin_session": "''",
+                    "origin_ui_session_id": "''",
+                    "state": "'unknown'",
+                    "dispatched_at": "0",
+                    "updated_at": "0",
+                    "delivery_state": "'pending'",
+                    "delivery_attempts": "0",
+                    "origin_session_id": "''",
+                }
+                select_exprs = [
+                    (
+                        f'COALESCE("{name}", {required_defaults[name]})'
+                        if name in legacy_columns and name in required_defaults
+                        else f'"{name}"'
+                        if name in legacy_columns
+                        else defaults[name]
+                    )
+                    for name in _ASYNC_COLUMNS
+                ]
+                rows = legacy.execute(
+                    "SELECT "
+                    + ", ".join(select_exprs)
+                    + " FROM async_delegations"
+                ).fetchall()
+                source = "copied"
+            else:
+                source = "no_table"
+        finally:
+            legacy.close()
+
+    placeholders = ", ".join("?" for _ in _ASYNC_COLUMNS)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        marker = conn.execute(
+            "SELECT value FROM async_delegation_store_meta WHERE key=?",
+            (_LEGACY_MIGRATION_KEY,),
+        ).fetchone()
+        if marker is None:
+            if rows:
+                conn.executemany(
+                    f"INSERT OR IGNORE INTO async_delegations "
+                    f"({', '.join(_ASYNC_COLUMNS)}) VALUES ({placeholders})",
+                    rows,
+                )
+            conn.execute(
+                """INSERT INTO async_delegation_store_meta
+                   (key, value, updated_at) VALUES (?, ?, ?)""",
+                (_LEGACY_MIGRATION_KEY, f"{source}:{len(rows)}", time.time()),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 @contextmanager
@@ -1601,3 +1784,5 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    with _SCHEMA_LOCK:
+        _INITIALIZED_DB_PATHS.clear()
