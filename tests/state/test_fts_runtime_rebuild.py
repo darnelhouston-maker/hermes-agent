@@ -1,4 +1,4 @@
-"""Runtime FTS-corruption self-heal on the SessionDB write path (#65637 class).
+"""Bounded FTS-corruption recovery on live SessionDB paths.
 
 A corrupted FTS5 shadow table (``messages_fts_data``) makes every message
 write raise ``sqlite3.DatabaseError: database disk image is malformed``
@@ -7,10 +7,9 @@ intact. Before this fix the gateway swallowed the failure at debug level and
 the in-memory session advanced while disk silently fell behind — surfacing
 later as "Persisted transcript lagged live cached history" amnesia.
 
-The fix: ``_execute_write`` first attempts a one-shot in-place FTS rebuild.
-If corruption persists, it records a durable stale marker, detaches the FTS
-sync triggers, and retries the canonical write. Search degrades to ``LIKE``
-until a later open atomically rebuilds the index and restores the triggers.
+The fix records a durable stale marker, detaches the FTS sync triggers, and
+retries the canonical write immediately. Live search degrades to canonical
+``LIKE`` queries. Rebuilds remain owned by guarded startup/offline repair.
 """
 
 import json
@@ -250,6 +249,8 @@ class TestRuntimeFtsRebuild:
         def _listdir(path):
             if isinstance(path, str):
                 path = path.replace("/proc", str(proc_root))
+            if str(path) == str(proc_root / "222" / "fd"):
+                raise PermissionError(path)
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
         # _read_proc_cmdline opens /proc/<pid>/cmdline directly; redirect
@@ -275,13 +276,29 @@ class TestRuntimeFtsRebuild:
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)
 
-    def test_corruption_error_classification_covers_both_sqlite_messages(self):
-        """SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic malformed-image error, newer builds raise an
-        FTS5-specific one. Both must trigger the self-heal."""
-        assert SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("database disk image is malformed")
+    def test_corruption_error_classification_requires_fts_evidence(self):
+        generic = sqlite3.DatabaseError("database disk image is malformed")
+        assert not SessionDB._is_fts_write_corruption_error(generic)
+
+        structural = sqlite3.DatabaseError("database disk image is malformed")
+        structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        structural.sqlite_errorname = "SQLITE_CORRUPT"
+        assert not SessionDB._is_fts_write_corruption_error(structural)
+
+        fts_virtual_table = sqlite3.DatabaseError(
+            "database disk image is malformed"
         )
+        fts_virtual_table.sqlite_errorcode = sqlite3.SQLITE_CORRUPT_VTAB
+        fts_virtual_table.sqlite_errorname = "SQLITE_CORRUPT_VTAB"
+        assert SessionDB._is_fts_write_corruption_error(fts_virtual_table)
+
+        contradictory = sqlite3.IntegrityError(
+            'fts5: corrupt structure record for table "messages_fts"'
+        )
+        contradictory.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        contradictory.sqlite_errorname = "SQLITE_CONSTRAINT_TRIGGER"
+        assert not SessionDB._is_fts_write_corruption_error(contradictory)
+
         assert SessionDB._is_fts_write_corruption_error(
             sqlite3.DatabaseError(
                 'fts5: corrupt structure record for table "messages_fts"'
@@ -307,6 +324,30 @@ class TestRuntimeFtsRebuild:
             "healed append",
         ]
 
+    def test_live_append_detaches_fts_without_running_full_rebuild(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A request-path write must never run the unbounded FTS rebuild."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: pytest.fail("live append attempted a full FTS rebuild"),
+        )
+
+        db.append_message("s1", "user", "canonical survives")
+
+        assert _message_contents(db_path)[-1] == "canonical survives"
+        assert db._fts_stale is True
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()
+
     def test_search_works_after_self_heal(self, db, tmp_path):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -315,43 +356,41 @@ class TestRuntimeFtsRebuild:
         _corrupt_fts(tmp_path / "state.db")
         db.append_message("s1", "user", "searchable needle text")
 
-        raw = sqlite3.connect(str(tmp_path / "state.db"))
-        hits = raw.execute(
-            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'needle'"
-        ).fetchall()
-        raw.close()
-        assert len(hits) == 1
+        results = db.search_messages("needle")
+        assert results
+        assert any("needle" in (row.get("snippet") or "") for row in results)
+        assert db._fts_stale is True
 
-    def test_search_messages_self_heals_after_fts_corruption(self, db, tmp_path):
-        """A read-only session that only SEARCHES (no write after corruption)
-        must self-heal too. The MATCH read raises the corruption class
-        (DatabaseError / 'fts5: corrupt structure record'), NOT the
-        OperationalError that search_messages caught — so before this fix the
-        search crashed until a write or restart rebuilt the index.
-        """
+    def test_search_messages_defers_rebuild_after_fts_corruption(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A live search detaches corrupt FTS and uses canonical rows."""
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "a searchable needle here")
 
         _corrupt_fts(tmp_path / "state.db")
-        # Injected via a raw connection, so no write on THIS instance has
-        # consumed the one-shot rebuild yet.
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: pytest.fail("live search attempted a full FTS rebuild"),
+        )
         assert db._fts_runtime_rebuild_attempted is False
 
         results = db.search_messages("needle")
 
-        assert db._fts_runtime_rebuild_attempted is True  # the search rebuilt it
-        assert results  # non-empty: the rebuilt index matched the query
+        assert db._fts_runtime_rebuild_attempted is False
+        assert db._fts_stale is True
+        assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(tmp_path / "state.db") == set()
+        assert results
         assert any("needle" in (r.get("snippet") or "") for r in results)
 
-    def test_trigram_search_self_heals_after_fts_corruption(self, db, tmp_path):
-        """The CJK/trigram MATCH branch has the same read-corruption exposure
-        as the main FTS5 branch: it caught only OperationalError (query
-        syntax), so a corrupt trigram shadow table raised DatabaseError
-        straight out of search_messages. It must self-heal via the shared
-        one-shot rebuild and answer from the rebuilt trigram index.
-        """
+    def test_trigram_search_defers_rebuild_after_fts_corruption(
+        self, db, tmp_path, monkeypatch
+    ):
+        """The trigram branch also fails open without a live rebuild."""
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         if not db._trigram_available:
@@ -360,16 +399,20 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "关于大别山项目的进展报告")
 
         _corrupt_trigram_fts(tmp_path / "state.db")
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: pytest.fail("live search attempted a full FTS rebuild"),
+        )
         assert db._fts_runtime_rebuild_attempted is False
 
         # >=3 CJK chars per token → routed to the trigram branch.
         results = db.search_messages("大别山项目")
 
-        assert db._fts_runtime_rebuild_attempted is True  # search rebuilt it
+        assert db._fts_runtime_rebuild_attempted is False
+        assert db._fts_stale is True
         assert results
-        # The rebuilt trigram index answered (trigram snippets use >>> <<<),
-        # i.e. we did not silently degrade to the LIKE fallback.
-        assert any(">>>" in (r.get("snippet") or "") for r in results)
+        assert any("大别山项目" in (r.get("snippet") or "") for r in results)
 
 
     def test_second_corruption_fails_open_and_rebuilds_on_reopen(
@@ -381,8 +424,8 @@ class TestRuntimeFtsRebuild:
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "seed")
         _corrupt_fts(db_path)
-        db.append_message("s1", "user", "first heal")  # consumes the one shot
-        assert db._fts_runtime_rebuild_attempted is True
+        db.append_message("s1", "user", "first heal")
+        assert db._fts_runtime_rebuild_attempted is False
 
         # A second corruption must not strand the canonical transcript. The
         # derived indexes are detached and marked stale instead of looping.
@@ -415,7 +458,7 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_failed_in_place_rebuild_fails_open(self, db, tmp_path, monkeypatch):
+    def test_live_write_never_calls_rebuild(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db_path = tmp_path / "state.db"
@@ -423,17 +466,18 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "seed")
         _corrupt_fts(db_path)
 
-        def _failed_rebuild():
-            raise sqlite3.DatabaseError("rebuild could not read corrupt FTS")
-
-        monkeypatch.setattr(db, "rebuild_fts", _failed_rebuild)
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: pytest.fail("live write attempted a full FTS rebuild"),
+        )
         db.append_message("s1", "user", "canonical survives")
 
         assert _message_contents(db_path)[-1] == "canonical survives"
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
-    def test_foreign_holder_skips_runtime_rebuild_and_fails_open(
+    def test_live_write_does_not_scan_foreign_holders(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -446,7 +490,7 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(
             db,
             "_foreign_state_db_holders",
-            lambda: [(4242, str(db_path) + "-wal")],
+            lambda: pytest.fail("live fail-open entered rebuild admission"),
             raising=False,
         )
 
