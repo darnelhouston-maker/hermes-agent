@@ -264,6 +264,7 @@ class CellAuthority:
         return self.ctx.run(self._invoke, tool_name, tool_args)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
+        from gateway.session_context import get_session_env
         from model_tools import handle_function_call
         previous = None
         if self._callbacks:
@@ -274,7 +275,12 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return handle_function_call(
+                tool_name,
+                tool_args,
+                task_id=self.task_id,
+                session_id=get_session_env("HERMES_SESSION_ID", "") or None,
+            )
         finally:
             if previous is not None:
                 try:

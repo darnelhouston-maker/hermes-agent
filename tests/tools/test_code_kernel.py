@@ -415,7 +415,7 @@ class TestPerCellRpcAuthority(unittest.TestCase):
     """Interpreter state persists across cells; RPC authority must not."""
 
     def _recorder(self, seen):
-        def _handle(tool_name, tool_args, task_id=None):
+        def _handle(tool_name, tool_args, task_id=None, session_id=None):
             from tools.thread_context import _callback_api
 
             (get_approval, _set_a), *_rest = _callback_api()
@@ -423,6 +423,7 @@ class TestPerCellRpcAuthority(unittest.TestCase):
                 {
                     "tool": tool_name,
                     "task_id": task_id,
+                    "session_id": session_id,
                     "approval_cb": get_approval(),
                 }
             )
@@ -457,6 +458,27 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         self.assertIs(seen[0]["approval_cb"], cb_one)
         self.assertIs(seen[1]["approval_cb"], cb_two)
         self.assertEqual(seen[0]["task_id"], "kernel-test")
+
+    def test_cell_rpc_forwards_captured_session_id_to_nested_tool_hooks(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        seen = []
+        tokens = set_session_vars(session_id="session-current-recovery")
+        try:
+            with _kernel_config(), patch(
+                "model_tools.handle_function_call", new=self._recorder(seen)
+            ):
+                result = _run(
+                    "import hermes_tools\n"
+                    "hermes_tools.web_search(query='synthetic')\n"
+                )
+        finally:
+            clear_session_vars(tokens)
+
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["task_id"], "kernel-test")
+        self.assertEqual(seen[0]["session_id"], "session-current-recovery")
 
     def test_cross_cell_alias_dispatches_under_the_current_cell(self):
         # Adversarial cross-cell dataflow: a callable captured in cell 1 and
