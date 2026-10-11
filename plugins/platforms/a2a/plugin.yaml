@@ -11,6 +11,10 @@ description: >
   tasks over JSON-RPC — works with any A2A-compliant peer (Hermes, LangChain,
   CrewAI, Google ADK, OpenClaw, ...).
 
+  SHARED STATE: work_item_read and work_item_append expose a minimal,
+  append-only fleet record keyed by work-item ID. Watson stores the record;
+  authenticated connected peers read and append through Watson.
+
   INBOUND (platform adapter): exposes Hermes as an A2A-discoverable agent. An
   Agent Card is served at /.well-known/agent-card.json (v1.0 canonical path;
   legacy agent.json also answers) and incoming tasks are routed
@@ -19,10 +23,11 @@ description: >
   context, not a throwaway clone.
 
   Security is on by default: no bearer token configured => localhost-only bind.
-  Inbound task text passes through prompt-injection filters; outbound text is
-  scrubbed of credential-shaped strings; every exchange is audit-logged and
-  persisted to disk outside the context-compaction pipeline so conversations
-  survive compaction and restarts.
+  Authenticated task bodies are preserved end to end. Credential-shaped
+  secrets are excluded from outbound payloads and audit summaries; ordinary
+  operational content, including email addresses, is preserved. Every exchange
+  is audit-logged and persisted outside the context-compaction pipeline so
+  conversations survive compaction and restarts.
 
   Pure stdlib transport (http.server + urllib) — no a2a-sdk dependency required.
 author: Nous Research
@@ -36,6 +41,8 @@ provides_tools:
   - a2a_list
   - a2a_history
   - a2a_orchestrate
+  - work_item_read
+  - work_item_append
 # requires_env / optional_env are surfaced in the `hermes config` UI via the
 # platform-plugin env var injector in hermes_cli/config.py.
 requires_env: []
