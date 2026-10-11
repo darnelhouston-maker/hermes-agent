@@ -52,12 +52,12 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     return runner
 
 
-def _event(*, profile: str | None) -> MessageEvent:
+def _event(*, profile: str | None, platform: Platform = Platform.TELEGRAM) -> MessageEvent:
     return MessageEvent(
         text="follow up",
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=Platform.TELEGRAM,
+            platform=platform,
             chat_id="chat-1",
             chat_type="dm",
             user_id="user-1",
@@ -65,6 +65,16 @@ def _event(*, profile: str | None) -> MessageEvent:
         ),
         message_id="message-1",
     )
+
+
+def test_a2a_busy_input_is_always_queued_without_changing_telegram():
+    runner = _runner(default_mode="interrupt")
+
+    a2a = _event(profile=None, platform=Platform("a2a"))
+    telegram = _event(profile=None, platform=Platform.TELEGRAM)
+
+    assert runner._effective_busy_input_mode(a2a.source) == "queue"
+    assert runner._effective_busy_input_mode(telegram.source) == "interrupt"
 
 
 def _adapter() -> _ProfileAdapter:

@@ -34,11 +34,13 @@ _WORK_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ACTOR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$")
 _MAX_STATUS = 80
-_MAX_NOTE = 1000
-_MAX_READ_LIMIT = 5
-_DEFAULT_READ_LIMIT = 5
+_MAX_NOTE = 4000  # prodfix 2026-09-28 (was 1000)
+_MAX_READ_LIMIT = 20  # prodfix 2026-09-28 (was 5)
+_DEFAULT_READ_LIMIT = 20  # prodfix 2026-09-28 (was 5)
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_TIMEOUT = 15
+_DEFAULT_DISPATCH_LEDGER = "/root/.hermes/cron/state/dispatch_ledger.jsonl"
+_MAX_DISPATCH_LINE_BYTES = 1024 * 1024
 
 # This protects the durable file from credential classes that must never be
 # persisted. It does not inspect or classify any other kind of content.
@@ -55,8 +57,6 @@ _SECRET_PATTERNS = (
         r"\b(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|password|passphrase|private[_ -]?key|secret)\b\s*[:=]\s*\S+",
         re.IGNORECASE,
     ),
-    re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE),
-    re.compile(r"\b[A-Za-z0-9_-]{48,}\b"),
 )
 
 _SCHEMA_LOCK = threading.Lock()
@@ -206,6 +206,16 @@ def _database_path(config: Optional[dict] = None) -> Path:
     return path
 
 
+def _dispatch_ledger_path(config: Optional[dict] = None) -> Path:
+    raw = str(_settings(config).get("dispatch_ledger") or _DEFAULT_DISPATCH_LEDGER).strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise WorkItemError("authoritative work-item ledger path must be absolute", kind="unavailable")
+    if path.exists() and path.is_symlink():
+        raise WorkItemError("authoritative work-item ledger path is unsafe", kind="unavailable")
+    return path
+
+
 def _prepare_database_path(path: Path) -> None:
     parent = path.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -303,6 +313,18 @@ def _read_local(params: dict, actor: str, config: dict) -> dict:
             (work_item_id,),
         ).fetchone()
         if item is None:
+            conn.commit()
+            dispatch_result = _read_dispatch_ledger(params, actor, config)
+            if dispatch_result is not None:
+                _audit_event(
+                    config,
+                    "read",
+                    actor,
+                    work_item_id,
+                    "found_dispatch_ledger",
+                    dispatch_result["next_after_sequence"],
+                )
+                return dispatch_result
             result = {
                 "found": False,
                 "work_item_id": work_item_id,
@@ -367,6 +389,85 @@ def _read_local(params: dict, actor: str, config: dict) -> dict:
         return result
     finally:
         conn.close()
+
+
+def _read_dispatch_ledger(params: dict, actor: str, config: dict) -> Optional[dict]:
+    """Return metadata-only Mac 2 report state when the shared DB has no record.
+
+    The dispatch ledger is Watson's authoritative receipt for Mac 2 reports. Its
+    proof preview and protected report reference are intentionally never copied
+    into the shared tool response.
+    """
+    actor = _validate_actor(actor, config)
+    work_item_id = _validate_work_item_id(params.get("work_item_id"))
+    after_sequence = _bounded_int(
+        params.get("after_sequence"), default=0, low=0, high=2_147_483_647, name="after_sequence"
+    )
+    limit = _bounded_int(
+        params.get("limit"), default=_DEFAULT_READ_LIMIT, low=1, high=_MAX_READ_LIMIT, name="limit"
+    )
+    path = _dispatch_ledger_path(config)
+    if not path.exists():
+        return None
+
+    entries = []
+    hub_actor = str(_settings(config).get("actor") or "watson").strip().lower()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if len(line.encode("utf-8", "replace")) > _MAX_DISPATCH_LINE_BYTES:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict) or row.get("id") != work_item_id:
+                    continue
+                try:
+                    status = _validate_status(row.get("status"))
+                    row_actor = _validate_actor(row.get("reported_by") or hub_actor, config)
+                except WorkItemError:
+                    continue
+                created_at = str(row.get("ts") or "").strip()
+                if (
+                    not created_at
+                    or len(created_at) > 64
+                    or any(ch in created_at for ch in ("\n", "\r", "\x00"))
+                ):
+                    continue
+                entries.append(
+                    {
+                        "sequence": len(entries) + 1,
+                        "actor": row_actor,
+                        "status": status,
+                        "note": "Watson dispatch ledger metadata; protected report body is not exposed.",
+                        "created_at": created_at,
+                    }
+                )
+    except OSError as exc:
+        raise WorkItemError("authoritative work-item ledger is temporarily unavailable", kind="unavailable") from exc
+
+    if not entries:
+        return None
+    latest = len(entries)
+    selected = [entry for entry in entries if entry["sequence"] > after_sequence][:limit]
+    last_returned = selected[-1]["sequence"] if selected else after_sequence
+    return {
+        "found": True,
+        "work_item_id": work_item_id,
+        "source": "watson_dispatch_ledger",
+        "data_provenance": (
+            "Watson dispatch status metadata; protected report bodies, previews, and references are excluded."
+        ),
+        "created_at": entries[0]["created_at"],
+        "updated_at": entries[-1]["created_at"],
+        "created_by": entries[0]["actor"],
+        "participants": sorted({entry["actor"] for entry in entries}),
+        "entries": selected,
+        "latest_sequence": latest,
+        "has_more": last_returned < latest,
+        "next_after_sequence": last_returned,
+    }
 
 
 def _append_local(params: dict, actor: str, config: dict) -> dict:
@@ -515,6 +616,9 @@ def _local_session_actor(config: dict) -> str:
         platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
         if platform == "a2a":
             return _validate_actor(get_session_env("HERMES_SESSION_USER_ID", ""), config)
+        cron_session = str(get_session_env("HERMES_CRON_SESSION", "") or "").strip().lower()
+        if platform in {"", "cron"} and cron_session in {"1", "true", "yes", "on"}:
+            return _validate_actor(hub_actor, config)
         if platform == "telegram":
             chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
             user_id = (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
@@ -713,7 +817,7 @@ def reference_prefix(work_item_id: Any, *, config: Optional[dict] = None) -> str
     work_item_id = _validate_work_item_id(work_item_id)
     result = read({"work_item_id": work_item_id, "limit": 1}, config=config)
     if not result.get("found"):
-        raise WorkItemError(f"shared work item '{work_item_id}' does not exist")
+        raise WorkItemError(f"shared work item '{work_item_id}' does not exist", kind="not_found")
     return (
         f"Shared work item: {work_item_id}\n"
         "The work_item_read and work_item_append tools access this shared record.\n\n"

@@ -582,14 +582,14 @@ class TestTaskStore:
         assert result == [(protocol.STATE_COMPLETED, "reply")]
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_COMPLETED
 
-    def test_stream_disconnect_releases_active_request(self, monkeypatch):
+    def test_stream_disconnect_detaches_without_canceling_active_request(self, monkeypatch):
         adapter, _base = _make_live_adapter(monkeypatch)
         rec = adapter.tasks.create("t-live", "c1", "peer")
         adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
         pending = {
             "task_id": "t-live", "context_id": "c1", "peer": "peer",
             "future": adapter._add_pending("t-live", "c1"),
-            "created_iso": rec["created_iso"], "started": time.time(),
+            "round_number": 1, "created_iso": rec["created_iso"], "started": time.time(),
         }
         monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
 
@@ -612,9 +612,13 @@ class TestTaskStore:
         adapter._rpc_message_stream(Handler(), 1, {}, "peer")
 
         stored = adapter.tasks.get("t-live")
-        assert stored["state"] == protocol.STATE_FAILED
-        assert stored["reply"] == "[client disconnected]"
-        assert "t-live" not in adapter._pending
+        assert stored["state"] == protocol.STATE_WORKING
+        assert "t-live" in adapter._active_tasks
+        pending["future"].set_result((protocol.STATE_COMPLETED, "late result"))
+        deadline = time.time() + 2
+        while time.time() < deadline and adapter.tasks.get("t-live")["state"] != protocol.STATE_COMPLETED:
+            time.sleep(0.01)
+        assert adapter.tasks.get("t-live")["reply"] == "late result"
         assert "t-live" not in adapter._active_tasks
 
     def test_list_newest_first_with_filters(self):

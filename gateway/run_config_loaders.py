@@ -363,6 +363,9 @@ class GatewayConfigLoadersMixin:
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
         """Resolve busy input mode from the routed profile startup snapshot."""
+        platform = str(getattr(getattr(source, "platform", None), "value", source.platform) or "").lower()
+        if platform == "a2a":
+            return "queue"
         return self._effective_busy_mode(source, "_busy_input_mode")
 
     def _effective_busy_text_mode(self, source: SessionSource) -> str:
