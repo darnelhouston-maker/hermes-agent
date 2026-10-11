@@ -30,6 +30,7 @@ Bind safety: with no token configured, the server binds 127.0.0.1 only.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -56,14 +57,20 @@ from gateway.platforms.base import (
 from gateway.config import Platform
 
 from . import protocol, security
+from .content_guard import (PeerVolumeAlarm, RecentInboundGuard, content_dedupe_window, start_volume_alarm, volume_alarm_settings)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 9900
-_ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
+_MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT = 300, 86400
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_WORK_ITEM_REF_RE = re.compile(r"^Shared work item:\s*([^\s]+)", re.IGNORECASE)
+
+
+class _ClientDisconnected(Exception):
+    """The streaming client left while the receiver task is still running."""
 
 
 def _reply_timeout() -> float:
@@ -72,6 +79,11 @@ def _reply_timeout() -> float:
         return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
     except (ValueError, TypeError):
         return 300.0
+
+
+def _orphan_timeout() -> float:
+    """Keep tasks queryable for at least the configured reply window."""
+    return min(float(_MAX_ORPHAN_TIMEOUT), max(float(_MIN_ORPHAN_TIMEOUT), _reply_timeout()))
 
 
 def _default_agent_name() -> str:
@@ -364,6 +376,11 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks = protocol.TaskStore()
         self._turns = protocol.TurnTracker()
         self._rate_limiter = protocol.RateLimiter()
+        self._content_guard = RecentInboundGuard(content_dedupe_window())
+        self._request_guard = RecentInboundGuard(content_dedupe_window())
+        self._active_work_items: dict[str, str] = {}
+        self._active_work_items_lock = threading.Lock()
+        self._volume_alarm = PeerVolumeAlarm(*volume_alarm_settings())
 
         # Forwarded profile sessions: map (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
@@ -471,8 +488,9 @@ class A2AAdapter(BasePlatformAdapter):
         """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
-                for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT):
-                    logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
+                timeout = _orphan_timeout()
+                for tid in self.tasks.fail_orphans(timeout):
+                    logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, timeout)
                     protocol.metrics.tasks_failed += 1
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
@@ -693,6 +711,50 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
+    def _duplicate_task(
+        self,
+        prior_task_id: str,
+        context_id: str,
+        peer: str,
+        scope: tuple[str, str],
+    ) -> tuple[dict, None]:
+        """Return the original task in-context, or a receipt pointing to it."""
+        if prior := self.tasks.get(prior_task_id, *scope):
+            return protocol.TaskStore.to_task(prior), None
+        rec = self.tasks.create(protocol.new_task_id(), context_id, peer, *scope)
+        self.tasks.complete(rec["task_id"], protocol.STATE_REJECTED, "")
+        return protocol.build_task(
+            rec["task_id"], context_id, protocol.STATE_REJECTED,
+            "Duplicate task suppressed: matching content was already accepted; do not resend.",
+            created_at=rec["created_iso"],
+        ), None
+
+    def _claim_active_work_item(
+        self,
+        peer: str,
+        scope: tuple[str, str],
+        text: str,
+        task_id: str,
+    ) -> str:
+        """Deduplicate reworded retries of one still-active shared work item."""
+        match = _WORK_ITEM_REF_RE.match(text)
+        if not match:
+            return ""
+        material = "\0".join((peer, scope[0], scope[1], match.group(1))).encode(
+            "utf-8", errors="replace"
+        )
+        key = hashlib.sha256(b"hermes-a2a-work-item-v1\0" + material).hexdigest()
+        with self._active_work_items_lock:
+            prior_task_id = self._active_work_items.get(key, "")
+            if prior_task_id:
+                prior = self.tasks.get(prior_task_id, *scope)
+                if prior is None or prior.get("state") not in (
+                    protocol.TERMINAL_STATES | {protocol.STATE_INPUT_REQUIRED}
+                ):
+                    return prior_task_id
+            self._active_work_items[key] = task_id
+        return ""
+
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message.
 
@@ -704,6 +766,29 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
+
+        scope = self._scope_for_agent(agent)
+        if text and (volume_count := self._volume_alarm.observe(peer, scope)):
+            logger.error("A2A: sender-to-peer volume alarm for peer %s (%d turns)", peer, volume_count)
+            start_volume_alarm(peer, scope, volume_count)
+        prior_task_id = self._claim_active_work_item(peer, scope, text, task_id) if text else ""
+        if prior_task_id:
+            protocol.metrics.anti_loop_triggers += 1
+            logger.warning("A2A: active shared work item suppressed for peer %s", peer)
+            return self._duplicate_task(prior_task_id, context_id, peer, scope)
+        message = params.get("message") if isinstance(params.get("message"), dict) else {}
+        request_id = str(message.get("messageId") or "").strip()
+        if request_id:
+            prior_task_id = self._request_guard.claim(peer, scope, request_id, task_id)
+            if prior_task_id:
+                protocol.metrics.anti_loop_triggers += 1
+                logger.warning("A2A: duplicate request id suppressed for peer %s", peer)
+                return self._duplicate_task(prior_task_id, context_id, peer, scope)
+        prior_task_id = self._content_guard.claim(peer, scope, text, task_id) if text else ""
+        if prior_task_id:
+            protocol.metrics.anti_loop_triggers += 1
+            logger.warning("A2A: duplicate content suppressed for peer %s", peer)
+            return self._duplicate_task(prior_task_id, context_id, peer, scope)
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -738,17 +823,32 @@ class A2AAdapter(BasePlatformAdapter):
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-            self.tasks.complete(task_id, state, reply)
-            protocol.persist_message(context_id, "agent", reply, task_id)
-            security.audit("outbound", peer, task_id, reply)
-            if state == protocol.STATE_COMPLETED:
-                protocol.metrics.outbound_total += 1
-                protocol.metrics.tasks_completed += 1
-            else:
-                protocol.metrics.tasks_failed += 1
-            self._send_push_notification(task_id, context_id, reply, state)
-            return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+            if self._blocking_requested(params):
+                reply, state = self._forward_to_profile(agent, peer, context_id, framed)
+                self.tasks.complete(task_id, state, reply)
+                protocol.persist_message(context_id, "agent", reply, task_id)
+                security.audit("outbound", peer, task_id, reply)
+                if state == protocol.STATE_COMPLETED:
+                    protocol.metrics.outbound_total += 1
+                    protocol.metrics.tasks_completed += 1
+                else:
+                    protocol.metrics.tasks_failed += 1
+                self._send_push_notification(task_id, context_id, reply, state)
+                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+            fut = self._add_pending(task_id, context_id)
+            self.tasks.set_state(task_id, protocol.STATE_WORKING)
+            pending = {
+                "task_id": task_id,
+                "context_id": context_id,
+                "peer": peer,
+                "future": fut,
+                "created_iso": rec["created_iso"],
+                "started": time.time(),
+                "profile_agent": agent,
+                "framed_text": framed,
+            }
+            self._start_profile_forward(pending)
+            return None, pending
 
         if self._loop is None or self._message_handler is None:
             self.tasks.complete(task_id, protocol.STATE_FAILED, "")
@@ -795,6 +895,21 @@ class A2AAdapter(BasePlatformAdapter):
             "created_iso": rec["created_iso"],
             "started": time.time(),
         }
+
+    def _start_profile_forward(self, pending: dict) -> None:
+        """Run a served-profile turn independently of the request socket."""
+        def run() -> None:
+            try:
+                reply, state = self._forward_to_profile(
+                    pending["profile_agent"], pending["peer"],
+                    pending["context_id"], pending["framed_text"],
+                )
+            except Exception as exc:
+                reply = security.redact_outbound(f"Profile dispatch failed: {exc}")
+                state = protocol.STATE_FAILED
+            self._resolve_task(pending["task_id"], state, reply)
+
+        threading.Thread(target=run, name=f"a2a-profile-{pending['task_id'][-8:]}", daemon=True).start()
 
     def _profile_state_db(self, profile: str) -> Optional[str]:
         home = _profile_home(profile)
@@ -943,22 +1058,38 @@ class A2AAdapter(BasePlatformAdapter):
                 if keepalive:
                     try:
                         keepalive()
-                    except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                    except Exception as exc:
+                        raise _ClientDisconnected from exc
             except Exception:
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
+
+    def _start_pending_finalizer(self, pending: dict) -> None:
+        """Keep a detached task alive and commit its eventual terminal result."""
+        def finalize() -> None:
+            self._finalize_task(pending, *self._await_reply(pending))
+        threading.Thread(target=finalize, name=f"a2a-finalize-{pending['task_id'][-8:]}", daemon=True).start()
+
+    @staticmethod
+    def _blocking_requested(params: dict) -> bool:
+        configuration = params.get("configuration") or {}
+        return not (isinstance(configuration, dict) and configuration.get("blocking") is False)
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         terminal, pending = self._prepare_task(params, peer, agent=agent)
         if terminal is not None:
             result = protocol.send_message_response(terminal) if v1_response else terminal
             return protocol.jsonrpc_result(req_id, result)
-        state, reply = self._await_reply(pending)
-        state, reply = self._finalize_task(pending, state, reply)
-        task = protocol.build_task(
-            pending["task_id"], pending["context_id"], state, reply,
-            created_at=pending["created_iso"],
-        )
+        if self._blocking_requested(params):
+            state, reply = self._await_reply(pending)
+            state, reply = self._finalize_task(pending, state, reply)
+            task = protocol.build_task(
+                pending["task_id"], pending["context_id"], state, reply,
+                created_at=pending["created_iso"],
+            )
+        else:
+            self._start_pending_finalizer(pending)
+            record = self.tasks.get(pending["task_id"], *self._scope_for_agent(agent))
+            task = protocol.TaskStore.to_task(record)
         result = protocol.send_message_response(task) if v1_response else task
         return protocol.jsonrpc_result(req_id, result)
 
@@ -1001,6 +1132,7 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.streams_started += 1
         self._sse_headers(handler)
 
+        pending = None
         try:
             terminal, pending = self._prepare_task(params, peer, agent=agent)
             if terminal is not None:
@@ -1023,8 +1155,10 @@ class A2AAdapter(BasePlatformAdapter):
                 pending, keepalive=lambda: self._sse_write(handler, ": keepalive\n\n"))
             state, reply = self._finalize_task(pending, state, reply)
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
-        except (BrokenPipeError, ConnectionResetError):
-            logger.debug("A2A: stream client disconnected")
+        except (_ClientDisconnected, BrokenPipeError, ConnectionResetError):
+            if pending is not None:
+                self._start_pending_finalizer(pending)
+            logger.debug("A2A: stream client disconnected; task remains active")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
