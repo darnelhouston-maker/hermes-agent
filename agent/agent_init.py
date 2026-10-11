@@ -2236,9 +2236,15 @@ def _snapshot_primary_runtime(agent):
 
 
 def _init_usage_state(agent):
-    from agent.runtime_cwd import scope_terminal_cwd
+    from agent.runtime_cwd import resolve_context_cwd, scope_terminal_cwd
+    # Root the hint tracker at the SAME directory the startup context loader used (session/cron
+    # workdir first, then TERMINAL_CWD). Rooting it at TERMINAL_CWD alone made a cron job with
+    # workdir=<project> treat <project> as an unvisited subdirectory of TERMINAL_CWD and splice a
+    # second, 32K-truncated copy of the already-loaded AGENTS.md into the first tool result.
+    _ctx_cwd = resolve_context_cwd()
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=scope_terminal_cwd() or None, enabled=not agent.skip_context_files)
+        working_dir=(str(_ctx_cwd) if _ctx_cwd else None) or scope_terminal_cwd() or None,
+        enabled=not agent.skip_context_files)
     _set_defaults(agent, _USAGE_STATE)
 
 
