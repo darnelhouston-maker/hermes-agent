@@ -476,7 +476,14 @@ class _SchemaOutcome:
     retries: int
 
 def _validate_child_output_schema(
-    child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
+    child: Any,
+    result: dict[str, Any],
+    task_index: int,
+    child_task_id: str,
+    relay_child_text: Any,
+    *,
+    parent_uid: Optional[int] = None,
+    parent_gid: Optional[int] = None,
 ) -> _SchemaOutcome:
     """Validate the final answer against the attached output_schema with ONE bounded retry. Schema-less children (no
     dict on ``child._delegate_output_schema``) take no branch here so their result entry stays byte-identical."""
@@ -496,7 +503,11 @@ def _validate_child_output_schema(
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
-        with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        with delegated_child_context(
+            str(getattr(child, "session_id", "") or ""),
+            parent_uid=parent_uid,
+            parent_gid=parent_gid,
+        ):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
                 stream_callback=relay_child_text,
@@ -719,6 +730,12 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    parent_uid: Optional[int] = field(
+        default_factory=lambda: int(os.geteuid()) if hasattr(os, "geteuid") else None
+    )
+    parent_gid: Optional[int] = field(
+        default_factory=lambda: int(os.getegid()) if hasattr(os, "getegid") else None
+    )
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -855,7 +872,11 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                parent_uid=self.parent_uid,
+                parent_gid=self.parent_gid,
+            ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )

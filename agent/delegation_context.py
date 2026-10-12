@@ -13,11 +13,16 @@ from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
+_DELEGATED_PARENT_IDENTITY: ContextVar[tuple[int, int] | None] = ContextVar(
+    "hermes_delegated_parent_identity", default=None
+)
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+DELEGATED_PARENT_UID_ENV = "HERMES_DELEGATED_PARENT_UID"
+DELEGATED_PARENT_GID_ENV = "HERMES_DELEGATED_PARENT_GID"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -25,18 +30,48 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+def _process_identity() -> tuple[int, int] | None:
+    """Return this process's effective POSIX identity when available."""
+    if not hasattr(os, "geteuid") or not hasattr(os, "getegid"):
+        return None
+    return int(os.geteuid()), int(os.getegid())
+
+
+def _parse_parent_identity(env: Mapping[str, str]) -> tuple[int, int] | None:
+    try:
+        uid = int(str(env.get(DELEGATED_PARENT_UID_ENV, "")).strip())
+        gid = int(str(env.get(DELEGATED_PARENT_GID_ENV, "")).strip())
+    except (TypeError, ValueError):
+        return None
+    return (uid, gid) if uid >= 0 and gid >= 0 else None
+
+
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None,
+    *,
+    parent_uid: int | None = None,
+    parent_gid: int | None = None,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity. Even a context
     entered without an id must restore the parent's session ContextVar (child
     construction calls ``set_current_session_id``)."""
+    if (parent_uid is None) != (parent_gid is None):
+        raise ValueError("delegated parent UID and GID must be supplied together")
+    identity = (
+        (int(parent_uid), int(parent_gid))
+        if parent_uid is not None and parent_gid is not None
+        else _DELEGATED_PARENT_IDENTITY.get() or _process_identity()
+    )
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    identity_token = _DELEGATED_PARENT_IDENTITY.set(identity)
     try:
         from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
 
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_PARENT_IDENTITY.reset(identity_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
@@ -109,6 +144,25 @@ def is_delegated_child_process_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
 
 
+def delegated_child_parent_identity(
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, int] | None:
+    """Return the invoking parent's numeric identity for delegated work.
+
+    In-process children use a ContextVar so concurrent delegations cannot
+    overwrite each other. Spawned descendants receive the same pair through
+    two Hermes-owned environment markers. Outside delegated execution there
+    is no identity contract and ``None`` is returned.
+    """
+    identity = _DELEGATED_PARENT_IDENTITY.get()
+    if _DELEGATED_CHILD_CONTEXT.get() and identity is not None:
+        return identity
+    source = os.environ if env is None else env
+    if not source.get(DELEGATED_CHILD_ENV_MARKER):
+        return None
+    return _parse_parent_identity(source)
+
+
 def _fenced_kanban_root() -> str:
     """The board root this process's Kanban lineage lives under (``kanban_home()``); ``"1"`` when it
     cannot be resolved, which readers treat as "fence every board" (the pre-path marker)."""
@@ -135,6 +189,12 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    identity = _DELEGATED_PARENT_IDENTITY.get() or _parse_parent_identity(env)
+    cleaned.pop(DELEGATED_PARENT_UID_ENV, None)
+    cleaned.pop(DELEGATED_PARENT_GID_ENV, None)
+    if identity is not None:
+        cleaned[DELEGATED_PARENT_UID_ENV] = str(identity[0])
+        cleaned[DELEGATED_PARENT_GID_ENV] = str(identity[1])
     return cleaned
 
 

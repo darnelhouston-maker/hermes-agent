@@ -285,6 +285,32 @@ def _finalize_child_env(env: dict) -> dict:
     return delegated_child_subprocess_env(env)
 
 
+def _delegated_popen_identity_kwargs(env: Mapping[str, str]) -> dict:
+    """Return identity arguments for a delegated local subprocess.
+
+    Sharing the parent's cwd/container does not guarantee that a privileged
+    worker creates parent-owned files. Root can drop to the numeric identity
+    captured by the parent; any other mismatch fails before the command has a
+    filesystem side effect.
+    """
+    if _IS_WINDOWS or not hasattr(os, "geteuid") or not hasattr(os, "getegid"):
+        return {}
+    from agent.delegation_context import delegated_child_parent_identity
+
+    identity = delegated_child_parent_identity(env)
+    if identity is None:
+        return {}
+    expected_uid, expected_gid = identity
+    current_uid, current_gid = os.geteuid(), os.getegid()
+    if current_uid == expected_uid and current_gid == expected_gid:
+        return {}
+    if current_uid == 0:
+        return {"user": expected_uid, "group": expected_gid, "extra_groups": ()}
+    raise PermissionError(
+        "delegated command identity does not match the invoking parent UID/GID"
+    )
+
+
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     """Filter each ``(items, unwrap_force)`` in *parts* into one env, rewrite PATH via
     *fix_path* (always prepending the hermes install dir so bare ``hermes`` resolves
@@ -1066,12 +1092,16 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        run_env = _make_run_env(self.env)
+        popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        if not _IS_WINDOWS:
+            popen_kwargs.update(_delegated_popen_identity_kwargs(run_env))
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+            **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
