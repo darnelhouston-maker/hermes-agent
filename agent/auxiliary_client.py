@@ -642,6 +642,20 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     return bare == "trinity-large-thinking"
 
 
+def _is_sakana_default_temperature_only(
+    model: Optional[str], provider: Optional[str]
+) -> bool:
+    """True for Sakana Fugu, which only accepts its server default.
+
+    Fugu rejects a caller-supplied non-default temperature with
+    ``code=unsupported_value``. Scope this capability to the exact provider
+    and model so identically named models on other OpenAI-compatible routes
+    keep their existing sampling behavior.
+    """
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (provider or "").strip().lower() == "sakana" and bare == "fugu"
+
+
 # Context window enforced by ChatGPT's Codex OAuth backend for the
 # gpt-5.4 / gpt-5.5 / gpt-5.6 families. The raw OpenAI API and OpenRouter
 # expose 1.05M for the same slugs, but the Codex backend hard-caps at 272K
@@ -724,6 +738,7 @@ def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> boo
 def _fixed_temperature_for_model(
     model: Optional[str],
     base_url: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> "Optional[float] | object":
     """Return a temperature directive for models with strict contracts.
 
@@ -737,6 +752,9 @@ def _fixed_temperature_for_model(
     """
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+        return OMIT_TEMPERATURE
+    if _is_sakana_default_temperature_only(model, provider):
+        logger.debug("Omitting temperature for Sakana model %r (default-only)", model)
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5
@@ -4446,6 +4464,8 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
     return any(marker in err_lower for marker in (
         "unsupported parameter",
         "unsupported_parameter",
+        "unsupported value",
+        "unsupported_value",
         "not supported",
         "does not support",
         "unknown parameter",
@@ -8649,7 +8669,7 @@ def _build_call_kwargs(
         "timeout": timeout,
     }
 
-    fixed_temperature = _fixed_temperature_for_model(model, base_url)
+    fixed_temperature = _fixed_temperature_for_model(model, base_url, provider)
     if fixed_temperature is OMIT_TEMPERATURE:
         temperature = None  # strip — let server choose
     elif fixed_temperature is not None:
