@@ -656,6 +656,20 @@ def _is_sakana_default_temperature_only(
     return (provider or "").strip().lower() == "sakana" and bare == "fugu"
 
 
+def _is_openai_default_temperature_only(model: Optional[str]) -> bool:
+    """True for reasoning models that only accept the server default.
+
+    OpenAI-compatible routes return ``code=unsupported_value`` when callers
+    send a non-default temperature to GPT-5 or o-series reasoning models.  The
+    non-reasoning ``gpt-5-chat`` line remains configurable and is deliberately
+    excluded.
+    """
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return bare.startswith(("gpt-5", "o1", "o3", "o4")) and not bare.startswith(
+        "gpt-5-chat"
+    )
+
+
 # Context window enforced by ChatGPT's Codex OAuth backend for the
 # gpt-5.4 / gpt-5.5 / gpt-5.6 families. The raw OpenAI API and OpenRouter
 # expose 1.05M for the same slugs, but the Codex backend hard-caps at 272K
@@ -755,6 +769,9 @@ def _fixed_temperature_for_model(
         return OMIT_TEMPERATURE
     if _is_sakana_default_temperature_only(model, provider):
         logger.debug("Omitting temperature for Sakana model %r (default-only)", model)
+        return OMIT_TEMPERATURE
+    if _is_openai_default_temperature_only(model):
+        logger.debug("Omitting temperature for %r (accepts only the default)", model)
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5

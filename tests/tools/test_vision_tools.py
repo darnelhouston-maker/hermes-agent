@@ -290,6 +290,18 @@ class TestVisionConfig:
         assert captured_wire["model"] == "fugu"
         assert "temperature" not in captured_wire
 
+    def test_vision_fallback_wire_payload_omits_default_only_temperature(self):
+        payload = _build_call_kwargs(
+            "openai-api",
+            "gpt-5.6-sol",
+            [{"role": "user", "content": "synthetic local image fallback"}],
+            temperature=0.1,
+            task="vision",
+        )
+
+        assert payload["model"] == "gpt-5.6-sol"
+        assert "temperature" not in payload
+
     @pytest.mark.asyncio
     async def test_temperature_and_timeout_come_from_config_with_defaults(self, tmp_path):
         img = tmp_path / "test.png"
