@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.auxiliary_client import _build_call_kwargs
+
 from tools.vision_tools import (
     _validate_image_url,
     _handle_vision_analyze,
@@ -242,6 +244,52 @@ class TestErrorLoggingExcInfo:
 
 
 class TestVisionConfig:
+    @pytest.mark.asyncio
+    async def test_local_image_sakana_fugu_wire_payload_omits_temperature(self, tmp_path):
+        img = tmp_path / "synthetic.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        captured_wire = {}
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Synthetic local image analysis"
+        mock_response.choices = [mock_choice]
+
+        async def fake_async_call_llm(**kwargs):
+            captured_wire.update(
+                _build_call_kwargs(
+                    "sakana",
+                    kwargs.get("model") or "fugu",
+                    kwargs["messages"],
+                    temperature=kwargs.get("temperature"),
+                    timeout=kwargs["timeout"],
+                )
+            )
+            return mock_response
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "auxiliary": {
+                        "vision": {"provider": "sakana", "model": "fugu"}
+                    }
+                },
+            ),
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch("tools.vision_tools.async_call_llm", side_effect=fake_async_call_llm),
+        ):
+            result = json.loads(
+                await vision_analyze_tool(str(img), "describe synthetic image", "fugu")
+            )
+
+        assert result["success"] is True
+        assert captured_wire["model"] == "fugu"
+        assert "temperature" not in captured_wire
+
     @pytest.mark.asyncio
     async def test_temperature_and_timeout_come_from_config_with_defaults(self, tmp_path):
         img = tmp_path / "test.png"

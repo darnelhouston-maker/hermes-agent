@@ -28,10 +28,33 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from agent.auxiliary_client import (
+    OMIT_TEMPERATURE,
+    _build_call_kwargs,
+    _fixed_temperature_for_model,
     call_llm,
     async_call_llm,
     _is_unsupported_temperature_error,
 )
+
+
+def test_sakana_fugu_omits_temperature_without_broadening_other_routes():
+    assert _fixed_temperature_for_model("fugu", provider="sakana") is OMIT_TEMPERATURE
+    assert _fixed_temperature_for_model("sakana/fugu", provider="sakana") is OMIT_TEMPERATURE
+
+    payload = _build_call_kwargs(
+        "sakana",
+        "fugu",
+        [{"role": "user", "content": "synthetic image"}],
+        temperature=0.1,
+    )
+    assert "temperature" not in payload
+
+    assert _build_call_kwargs(
+        "other-provider", "fugu", [], temperature=0.1
+    )["temperature"] == 0.1
+    assert _build_call_kwargs(
+        "sakana", "other-model", [], temperature=0.1
+    )["temperature"] == 0.1
 
 
 class TestIsUnsupportedTemperatureError:
@@ -43,6 +66,12 @@ class TestIsUnsupportedTemperatureError:
         "Error code: 400 - {'error': {'message': \"Unsupported parameter: 'temperature'\"}}",
         # Copilot / OpenAI error-code form
         "Error code: 400 - {'error': {'code': 'unsupported_parameter', 'param': 'temperature'}}",
+        (
+            "Error code: 400 - {'error': {'message': \"Unsupported value: "
+            "'temperature' does not support 0.1 with this model. Only the "
+            "default (1) value is supported.\", 'param': 'temperature', "
+            "'code': 'unsupported_value'}}"
+        ),
         # OpenRouter-style
         "Provider returned error: temperature is not supported for this model",
         "this model does not support temperature",
