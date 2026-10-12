@@ -51,6 +51,12 @@ from tools.code_execution_tool import (
 from tools.registry import registry
 
 
+_SYNTHETIC_CONTEXT_HINT = (
+    "[Subdirectory context discovered: fixture/AGENTS.md]\n"
+    "Synthetic fixture guidance."
+)
+
+
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
@@ -110,6 +116,17 @@ class TestInterruptedOutput(unittest.TestCase):
 
 
 class TestHermesToolsGeneration(unittest.TestCase):
+    @staticmethod
+    def _generated_namespace(transport="uds"):
+        namespace = {}
+        exec(
+            generate_hermes_tools_module(
+                list(SANDBOX_ALLOWED_TOOLS), transport=transport
+            ),
+            namespace,
+        )
+        return namespace
+
     def test_generates_all_allowed_tools(self):
         src = generate_hermes_tools_module(list(SANDBOX_ALLOWED_TOOLS))
         for tool in SANDBOX_ALLOWED_TOOLS:
@@ -143,6 +160,58 @@ class TestHermesToolsGeneration(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="file")
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
+
+    def test_rpc_result_parser_accepts_valid_json_only(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        self.assertEqual(parse('{"matches": []}'), {"matches": []})
+
+    def test_rpc_result_parser_accepts_json_with_context_hint(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        parsed = parse(
+            '{"matches": [{"file": "fixture.txt"}]}\n\n'
+            + _SYNTHETIC_CONTEXT_HINT
+        )
+        self.assertEqual(parsed["matches"], [{"file": "fixture.txt"}])
+        self.assertEqual(
+            parsed["_hermes_tool_commentary"], _SYNTHETIC_CONTEXT_HINT
+        )
+
+    def test_rpc_result_parser_accepts_trailing_whitespace(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        self.assertEqual(parse('  {"matches": []}\n\t '), {"matches": []})
+
+    def test_rpc_result_parser_rejects_malformed_or_truncated_json(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        with self.assertRaises(json.JSONDecodeError):
+            parse('{"matches": [')
+
+    def test_rpc_result_parser_rejects_two_json_documents(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        with self.assertRaisesRegex(ValueError, "multiple JSON documents"):
+            parse('{"matches": []}\n{"unexpected": true}')
+
+    def test_rpc_result_parser_rejects_truncated_second_document(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        with self.assertRaisesRegex(ValueError, "ambiguous trailing structured data"):
+            parse('{"matches": []}\n{"unexpected":')
+
+    def test_rpc_result_parser_bounds_preserved_commentary(self):
+        parse = self._generated_namespace()["_parse_tool_result"]
+        parsed = parse('{"matches": []}\nHint: ' + ("x" * 40_000))
+        self.assertLessEqual(len(parsed["_hermes_tool_commentary"]), 32_030)
+        self.assertTrue(
+            parsed["_hermes_tool_commentary"].endswith(
+                "[tool commentary truncated]"
+            )
+        )
+
+    def test_file_transport_uses_same_rpc_result_parser(self):
+        parse = self._generated_namespace(transport="file")["_parse_tool_result"]
+        parsed = parse('{"matches": []}\n' + _SYNTHETIC_CONTEXT_HINT)
+        self.assertEqual(parsed["matches"], [])
+        self.assertEqual(
+            parsed["_hermes_tool_commentary"], _SYNTHETIC_CONTEXT_HINT
+        )
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
@@ -276,6 +345,42 @@ print(result.get("output", ""))
         result = self._run(code)
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
+        self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_search_files_result_with_context_hint_is_structured(self):
+        """A provider hint after one JSON result must not break the bridge."""
+        code = """
+from hermes_tools import search_files
+result = search_files(pattern="*.txt", target="files", path="fixture")
+print(len(result["matches"]))
+print(result["_hermes_tool_commentary"].startswith("[Subdirectory context"))
+"""
+
+        def decorated_result(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "search_files":
+                return (
+                    json.dumps({"matches": [{"file": "fixture.txt"}]})
+                    + "\n\n"
+                    + _SYNTHETIC_CONTEXT_HINT
+                )
+            return _mock_handle_function_call(
+                function_name,
+                function_args,
+                task_id=task_id,
+                user_task=user_task,
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=decorated_result):
+            result = json.loads(
+                execute_code(
+                    code=code,
+                    task_id="test-decorated-search-result",
+                    enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                )
+            )
+
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertIn("1\nTrue", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
 

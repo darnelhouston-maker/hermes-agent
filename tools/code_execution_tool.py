@@ -504,6 +504,68 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+_MAX_TOOL_COMMENTARY_CHARS = 32_000
+_TOOL_COMMENTARY_KEY = "_hermes_tool_commentary"
+
+
+def _parse_tool_result(raw):
+    """Decode one JSON tool result plus optional non-JSON commentary.
+
+    Hermes may append provider/runtime guidance to an otherwise structured tool
+    result. ``json.loads`` rejects that valid result with ``Extra data``. Decode
+    exactly one document, retain textual commentary in a bounded explicit field,
+    and reject a second (or apparently truncated) structured document.
+    """
+    if not isinstance(raw, str):
+        return raw
+
+    text = raw.lstrip()
+    decoder = json.JSONDecoder()
+    result, end = decoder.raw_decode(text)
+    commentary = text[end:].strip()
+    if not commentary:
+        return result
+
+    try:
+        decoder.raw_decode(commentary)
+    except json.JSONDecodeError:
+        # A bracketed runtime hint is the observed provider-commentary shape.
+        # Other JSON-looking tails are ambiguous (usually truncated JSON), so
+        # fail closed instead of relabeling them as prose.
+        known_bracketed_hint = commentary.startswith((
+            "[Subdirectory context discovered:",
+            "[Tool loop warning:",
+            "[Tool loop hard stop:",
+        ))
+        first = commentary[:1]
+        looks_structured = (
+            first in "{\\\""
+            or first.isdigit()
+            or commentary.startswith(("true", "false", "null"))
+            or (first == "[" and not known_bracketed_hint)
+        )
+        if looks_structured:
+            raise ValueError(
+                "ambiguous trailing structured data after tool JSON result"
+            )
+    else:
+        raise ValueError("multiple JSON documents in one tool result")
+
+    if not isinstance(result, dict):
+        raise ValueError("tool commentary can only annotate a JSON object result")
+    if _TOOL_COMMENTARY_KEY in result:
+        raise ValueError("tool result uses reserved commentary field")
+
+    if len(commentary) > _MAX_TOOL_COMMENTARY_CHARS:
+        commentary = (
+            commentary[:_MAX_TOOL_COMMENTARY_CHARS]
+            + "\\n[tool commentary truncated]"
+        )
+    result = dict(result)
+    result[_TOOL_COMMENTARY_KEY] = commentary
+    return result
+
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------
@@ -564,10 +626,10 @@ def _call(tool_name, args):
             if buf.endswith(b"\\n"):
                 break
     raw = buf.decode().strip()
-    result = json.loads(raw)
+    result = _parse_tool_result(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            return _parse_tool_result(result)
         except (json.JSONDecodeError, TypeError):
             return result
     return result
@@ -630,10 +692,10 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    result = json.loads(raw)
+    result = _parse_tool_result(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            return _parse_tool_result(result)
         except (json.JSONDecodeError, TypeError):
             return result
     return result
