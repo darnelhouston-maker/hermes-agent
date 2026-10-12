@@ -115,4 +115,3 @@ def test_child_subprocess_outputs_remain_parent_writable(tmp_path: Path) -> None
     assert result["returncode"] == 0
     assert (tmp_path / "subprocess/nested/output").stat().st_uid == os.geteuid()
     _assert_parent_can_publish_phase_report(tmp_path / "subprocess")
-
