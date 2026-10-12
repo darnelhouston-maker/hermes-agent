@@ -12,15 +12,14 @@ reasons. Several provider/model combinations reject ``temperature`` with a
   * Anthropic Opus 4.7+ via OpenAI-compat endpoints
   * Kimi/Moonshot (server-managed)
 
-``_fixed_temperature_for_model`` catches Kimi up front, and
-``build_chat_completion_kwargs`` drops temperature for Anthropic Opus 4.7+,
-but the same backend can accept ``temperature`` for some models and reject
-it for others (for example gpt-5.4 accepts but gpt-5.5 rejects on the same
-endpoint). An allow/deny-list is not maintainable across providers.
+``_fixed_temperature_for_model`` catches known default-only families up front,
+and ``build_chat_completion_kwargs`` drops temperature for Anthropic Opus
+4.7+. The reactive retry remains for future or provider-specific models that
+cannot be identified safely before their first rejection.
 
-The universal fix is reactive: when a call returns an
+The safety net is reactive: when an otherwise-unknown model returns an
 ``Unsupported parameter: temperature`` 400, retry once without temperature.
-These tests lock in that behaviour for both sync and async paths.
+These tests lock in both the proactive and reactive behavior.
 """
 
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -55,6 +54,37 @@ def test_sakana_fugu_omits_temperature_without_broadening_other_routes():
     assert _build_call_kwargs(
         "sakana", "other-model", [], temperature=0.1
     )["temperature"] == 0.1
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-sol",
+        "openai/gpt-5.6-sol",
+        "gpt-5.5-pro",
+        "gpt-5.4",
+        "o1",
+        "o3-mini",
+        "o4-mini",
+    ],
+)
+def test_default_only_reasoning_families_omit_temperature(model):
+    assert _fixed_temperature_for_model(model, provider="openai-api") is OMIT_TEMPERATURE
+    payload = _build_call_kwargs(
+        "openai-api",
+        model,
+        [{"role": "user", "content": "synthetic fallback"}],
+        temperature=0.1,
+    )
+    assert "temperature" not in payload
+
+
+def test_configurable_openai_models_keep_temperature():
+    for model in ("gpt-5-chat-latest", "gpt-4.1", "gpt-4o"):
+        payload = _build_call_kwargs(
+            "openai-api", model, [], temperature=0.1
+        )
+        assert payload["temperature"] == 0.1
 
 
 class TestIsUnsupportedTemperatureError:
@@ -122,9 +152,9 @@ class TestCallLlmUnsupportedTemperatureRetry:
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+                  return_value=("openai-codex", "future-reasoning", None, None, None)),
             patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
+                  return_value=(client, "future-reasoning")),
             patch("agent.auxiliary_client._validate_llm_response",
                   side_effect=lambda resp, _task, **_kw: resp),
         ):
@@ -160,9 +190,9 @@ class TestCallLlmUnsupportedTemperatureRetry:
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+                  return_value=("openai-codex", "future-reasoning", None, None, None)),
             patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
+                  return_value=(client, "future-reasoning")),
             patch("agent.auxiliary_client._validate_llm_response",
                   side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
@@ -222,9 +252,9 @@ class TestAsyncCallLlmUnsupportedTemperatureRetry:
 
         with (
             patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+                  return_value=("openai-codex", "future-reasoning", None, None, None)),
             patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
+                  return_value=(client, "future-reasoning")),
             patch("agent.auxiliary_client._validate_llm_response",
                   side_effect=lambda resp, _task, **_kw: resp),
         ):
