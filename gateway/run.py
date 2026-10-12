@@ -9740,6 +9740,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
         """Resolve busy input mode from the routed profile startup snapshot."""
+        platform = str(
+            getattr(getattr(source, "platform", None), "value", source.platform) or ""
+        ).lower()
+        if platform == "a2a":
+            return "queue"
         fallback = getattr(self, "_busy_input_mode", "interrupt")
         profile_name = self._busy_profile_name_for_source(source)
         if not profile_name:

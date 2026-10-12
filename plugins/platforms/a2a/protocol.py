@@ -258,12 +258,12 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
     return {"data": data, "mediaType": media_type}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
+def text_message(role: str, text: str, context_id: str = "", message_id: str = "") -> dict:
     """Build an A2A v1.0 Message with a single text Part."""
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
         "parts": [text_part(text)],
-        "messageId": uuid.uuid4().hex,
+        "messageId": message_id or uuid.uuid4().hex,
     }
     if context_id:
         msg["contextId"] = context_id
