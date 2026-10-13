@@ -72,6 +72,40 @@ _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
 
+# browser-harness 0.1.13 can leave a background target compositor-idle: DOM/CDP
+# reads keep working, but Page.captureScreenshot waits for its full 60-second IPC
+# budget. Wake only the target this exec already owns before capture, then retry
+# exactly once when the harness reports that specific timeout.
+_SCREENSHOT_RELIABILITY_PREAMBLE = """\
+# hermes: wake a background target before browser-harness screenshots
+try:
+    import time as _hermes_screenshot_time
+    from browser_harness import helpers as _hermes_screenshot_helpers
+
+    _hermes_original_capture_screenshot = _hermes_screenshot_helpers.capture_screenshot
+
+    def _hermes_wake_screenshot_target():
+        _target = _hermes_screenshot_helpers.current_tab()
+        _hermes_screenshot_helpers.activate_tab(_target)
+        _hermes_screenshot_time.sleep(0.25)
+
+    def _hermes_capture_screenshot(path=None, full=False, max_dim=None):
+        _hermes_wake_screenshot_target()
+        try:
+            return _hermes_original_capture_screenshot(path=path, full=full, max_dim=max_dim)
+        except Exception as _exc:
+            _detail = str(_exc).lower()
+            if "page.capturescreenshot" not in _detail or "timed out" not in _detail:
+                raise
+            _hermes_wake_screenshot_target()
+            return _hermes_original_capture_screenshot(path=path, full=full, max_dim=max_dim)
+
+    capture_screenshot = _hermes_capture_screenshot
+    _hermes_screenshot_helpers.capture_screenshot = _hermes_capture_screenshot
+except (ImportError, AttributeError):
+    pass
+"""
+
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
@@ -744,6 +778,7 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+    code = _SCREENSHOT_RELIABILITY_PREAMBLE + code
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
