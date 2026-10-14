@@ -55,3 +55,26 @@ def test_a2a_call_schema_round_trips_through_tool_describe(monkeypatch):
         "work_item_id",
         "idempotency_key",
     }
+
+
+def test_work_item_append_exposes_typed_provenance_and_gates(monkeypatch):
+    registry = ToolRegistry()
+    monkeypatch.setattr(
+        a2a_tools,
+        "_load_config",
+        lambda: {"a2a_agents": {"peer": {"url": "http://localhost:9999"}}},
+    )
+
+    class _Context:
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            registry.register(name=name, toolset=toolset, schema=schema, handler=handler, **kwargs)
+
+    a2a_tools.register_tools(_Context())
+    definition = registry.get_definitions({"work_item_append"})[0]
+    properties = definition["function"]["parameters"]["properties"]
+    assert properties["provenance"]["additionalProperties"] is False
+    assert "originating_principal" in properties["provenance"]["properties"]
+    assert "transport_authenticated_peer" in properties["provenance"]["properties"]
+    assert properties["gates"]["additionalProperties"] is False
+    assert "password_reset_state" in properties["gates"]["properties"]
+    assert "lost_before_persistence" in properties["gates"]["properties"]["password_reset_state"]["enum"]

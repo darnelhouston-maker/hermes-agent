@@ -41,6 +41,21 @@ _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_TIMEOUT = 15
 _DEFAULT_DISPATCH_LEDGER = "/root/.hermes/cron/state/dispatch_ledger.jsonl"
 _MAX_DISPATCH_LINE_BYTES = 1024 * 1024
+_MAX_METADATA_BYTES = 32 * 1024
+_PROVENANCE_FIELDS = frozenset({
+    "originating_principal", "transport_authenticated_peer", "causal_reporter", "intake_context", "intake_task",
+    "producer_receipt", "local_session", "stage_invocation", "dispatch_correlation_id", "queue_receipt",
+    "return_channel", "operational_owner", "owner_thread", "notification_target", "parent_item",
+})
+_GATE_FIELDS = frozenset({
+    "account_unlock_state", "password_reset_state", "authentication_login_verification_state",
+    "credential_persistence_state", "credential_delivery_state", "human_captcha_gate_state",
+    "prepared_task_artifact_state", "side_effect_authorization_state",
+})
+_GATE_VALUES = frozenset({
+    "unknown", "not_applicable", "not_requested", "pending", "prepared", "preserved", "blocked",
+    "failed", "lost_before_persistence", "complete", "verified", "delivered", "authorized", "unauthorized",
+})
 
 # This protects the durable file from credential classes that must never be
 # persisted. It does not inspect or classify any other kind of content.
@@ -180,6 +195,34 @@ def _validate_idempotency_key(value: Any) -> str:
     return key
 
 
+def _validate_metadata(
+    value: Any,
+    *,
+    name: str,
+    allowed: frozenset[str],
+    allowed_values: Optional[frozenset[str]] = None,
+) -> dict:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise WorkItemError(f"{name} must be an object")
+    unknown = set(value) - allowed
+    if unknown:
+        raise WorkItemError(f"{name} contains unsupported field: {sorted(unknown)[0]}")
+    clean = {}
+    for key, raw in value.items():
+        if not isinstance(raw, str):
+            raise WorkItemError(f"{name}.{key} has an unsupported value")
+        if allowed_values is not None and raw not in allowed_values:
+            raise WorkItemError(f"{name}.{key} has an unsupported state")
+        clean[key] = raw
+    encoded = json.dumps(clean, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _MAX_METADATA_BYTES:
+        raise WorkItemError(f"{name} is too large")
+    _reject_secrets(encoded)
+    return clean
+
+
 def _reject_secrets(value: str) -> None:
     if any(pattern.search(value) for pattern in _SECRET_PATTERNS):
         raise WorkItemError("credential-like content cannot be stored in a shared work item")
@@ -284,6 +327,11 @@ def _connect(config: Optional[dict] = None) -> sqlite3.Connection:
                     ON work_item_audit(work_item_id, audit_id);
                     """
                 )
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(work_item_entries)")}
+                if "provenance_json" not in columns:
+                    conn.execute("ALTER TABLE work_item_entries ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'")
+                if "gates_json" not in columns:
+                    conn.execute("ALTER TABLE work_item_entries ADD COLUMN gates_json TEXT NOT NULL DEFAULT '{}'")
                 conn.commit()
             finally:
                 conn.close()
@@ -339,7 +387,7 @@ def _read_local(params: dict, actor: str, config: dict) -> dict:
             return result
         rows = conn.execute(
             """
-            SELECT sequence, actor, status, note, created_at
+            SELECT sequence, actor, status, note, created_at, provenance_json, gates_json
             FROM work_item_entries
             WHERE work_item_id = ? AND sequence > ?
             ORDER BY sequence ASC
@@ -367,6 +415,8 @@ def _read_local(params: dict, actor: str, config: dict) -> dict:
                 "status": row["status"],
                 "note": row["note"],
                 "created_at": row["created_at"],
+                "provenance": json.loads(row["provenance_json"] or "{}"),
+                "gates": json.loads(row["gates_json"] or "{}"),
             }
             for row in rows
         ]
@@ -426,6 +476,12 @@ def _read_dispatch_ledger(params: dict, actor: str, config: dict) -> Optional[di
                 try:
                     status = _validate_status(row.get("status"))
                     row_actor = _validate_actor(row.get("reported_by") or hub_actor, config)
+                    contract = row.get("handoff_contract") or {}
+                    provenance = _validate_metadata(contract.get("provenance"), name="provenance",
+                                                    allowed=_PROVENANCE_FIELDS)
+                    gates = _validate_metadata(
+                        contract.get("gates"), name="gates", allowed=_GATE_FIELDS, allowed_values=_GATE_VALUES
+                    )
                 except WorkItemError:
                     continue
                 created_at = str(row.get("ts") or "").strip()
@@ -442,6 +498,8 @@ def _read_dispatch_ledger(params: dict, actor: str, config: dict) -> Optional[di
                         "status": status,
                         "note": "Watson dispatch ledger metadata; protected report body is not exposed.",
                         "created_at": created_at,
+                        "provenance": provenance,
+                        "gates": gates,
                     }
                 )
     except OSError as exc:
@@ -463,6 +521,8 @@ def _read_dispatch_ledger(params: dict, actor: str, config: dict) -> Optional[di
         "updated_at": entries[-1]["created_at"],
         "created_by": entries[0]["actor"],
         "participants": sorted({entry["actor"] for entry in entries}),
+        "originating_principal": next((entry["provenance"].get("originating_principal") for entry in entries
+                                       if entry.get("provenance", {}).get("originating_principal")), "unavailable"),
         "entries": selected,
         "latest_sequence": latest,
         "has_more": last_returned < latest,
@@ -476,20 +536,27 @@ def _append_local(params: dict, actor: str, config: dict) -> dict:
     status = _validate_status(params.get("status"))
     note = _validate_note(params.get("note"))
     idempotency_key = _validate_idempotency_key(params.get("idempotency_key"))
+    provenance = _validate_metadata(params.get("provenance"), name="provenance", allowed=_PROVENANCE_FIELDS)
+    gates = _validate_metadata(
+        params.get("gates"), name="gates", allowed=_GATE_FIELDS, allowed_values=_GATE_VALUES
+    )
+    provenance_json = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    gates_json = json.dumps(gates, sort_keys=True, separators=(",", ":"))
     conn = _connect(config)
     try:
         conn.execute("BEGIN IMMEDIATE")
         created_at = _now()
         duplicate = conn.execute(
             """
-            SELECT sequence, status, note, created_at
+            SELECT sequence, status, note, created_at, provenance_json, gates_json
             FROM work_item_entries
             WHERE work_item_id = ? AND actor = ? AND idempotency_key = ?
             """,
             (work_item_id, actor, idempotency_key),
         ).fetchone()
         if duplicate is not None:
-            if duplicate["status"] != status or duplicate["note"] != note:
+            if (duplicate["status"] != status or duplicate["note"] != note
+                    or duplicate["provenance_json"] != provenance_json or duplicate["gates_json"] != gates_json):
                 conn.rollback()
                 raise WorkItemError(
                     "idempotency_key was already used with different content", kind="conflict"
@@ -511,6 +578,8 @@ def _append_local(params: dict, actor: str, config: dict) -> dict:
                 "status": duplicate["status"],
                 "note": duplicate["note"],
                 "created_at": duplicate["created_at"],
+                "provenance": json.loads(duplicate["provenance_json"] or "{}"),
+                "gates": json.loads(duplicate["gates_json"] or "{}"),
             }
 
         item = conn.execute(
@@ -530,10 +599,11 @@ def _append_local(params: dict, actor: str, config: dict) -> dict:
         conn.execute(
             """
             INSERT INTO work_item_entries(
-                work_item_id, sequence, actor, status, note, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                work_item_id, sequence, actor, status, note, idempotency_key, created_at,
+                provenance_json, gates_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (work_item_id, sequence, actor, status, note, idempotency_key, created_at),
+            (work_item_id, sequence, actor, status, note, idempotency_key, created_at, provenance_json, gates_json),
         )
         conn.execute(
             "UPDATE work_items SET updated_at = ? WHERE work_item_id = ?",
@@ -556,6 +626,8 @@ def _append_local(params: dict, actor: str, config: dict) -> dict:
             "status": status,
             "note": note,
             "created_at": created_at,
+            "provenance": provenance,
+            "gates": gates,
         }
     except sqlite3.Error as exc:
         conn.rollback()
@@ -755,6 +827,10 @@ def append(params: dict, *, actor: Optional[str] = None, config: Optional[dict] 
         "status": _validate_status(params.get("status")),
         "note": _validate_note(params.get("note")),
         "idempotency_key": _validate_idempotency_key(params.get("idempotency_key")),
+        "provenance": _validate_metadata(params.get("provenance"), name="provenance", allowed=_PROVENANCE_FIELDS),
+        "gates": _validate_metadata(
+            params.get("gates"), name="gates", allowed=_GATE_FIELDS, allowed_values=_GATE_VALUES
+        ),
     }
     if _role(config) == "hub":
         return _append_local(clean, actor or _local_session_actor(config), config)

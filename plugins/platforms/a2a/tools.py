@@ -900,6 +900,18 @@ def _str(description: str) -> dict:
     return {"type": "string", "description": description}
 
 
+def _typed_metadata(fields: list[str], description: str, *, states: Optional[list[str]] = None) -> dict:
+    value_schema = {"type": "string"}
+    if states is not None:
+        value_schema["enum"] = states
+    return {
+        "type": "object",
+        "description": description,
+        "properties": {field: dict(value_schema) for field in fields},
+        "additionalProperties": False,
+    }
+
+
 # name -> (handler, description, properties, required)
 _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
     "a2a_discover": (a2a_discover,
@@ -967,6 +979,28 @@ _WORK_ITEM_TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
             "status": _str("Short status label."),
             "note": _str("Optional factual note for the shared record."),
             "idempotency_key": _str("Required stable key; reuse only when retrying the exact same append."),
+            "provenance": _typed_metadata(
+                [
+                    "originating_principal", "transport_authenticated_peer", "causal_reporter", "intake_context",
+                    "intake_task", "producer_receipt", "local_session", "stage_invocation",
+                    "dispatch_correlation_id", "queue_receipt", "return_channel", "operational_owner",
+                    "owner_thread", "notification_target", "parent_item",
+                ],
+                "Optional typed provenance. Use originating_principal=unavailable when authorship is unproven; never infer it from the relay.",
+            ),
+            "gates": _typed_metadata(
+                [
+                    "account_unlock_state", "password_reset_state", "authentication_login_verification_state",
+                    "credential_persistence_state", "credential_delivery_state", "human_captcha_gate_state",
+                    "prepared_task_artifact_state", "side_effect_authorization_state",
+                ],
+                "Optional independent gate states; do not collapse them into the top-level status.",
+                states=[
+                    "unknown", "not_applicable", "not_requested", "pending", "prepared", "preserved", "blocked",
+                    "failed", "lost_before_persistence", "complete", "verified", "delivered", "authorized",
+                    "unauthorized",
+                ],
+            ),
         },
         ["work_item_id", "status", "idempotency_key"],
     ),
