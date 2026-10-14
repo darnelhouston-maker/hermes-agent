@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import importlib.util
 import logging
 import os
 import re
@@ -225,9 +226,23 @@ _PLATFORM_LAZY_DEPS: dict[tuple[str, str], tuple[str, ...]] = {
     ("tool.computer_use", "win32"): ("pywin32==311",),
 }
 
+_PLATFORM_IMPORT_PROBES: dict[tuple[str, str, str], str] = {
+    ("tool.computer_use", "win32", "pywin32"): "pywintypes",
+}
+
 
 def _feature_specs(feature: str) -> tuple[str, ...]:
     return LAZY_DEPS[feature] + _PLATFORM_LAZY_DEPS.get((feature, sys.platform), ())
+
+
+def _required_import_missing(feature: str, spec: str) -> bool:
+    module = _PLATFORM_IMPORT_PROBES.get((feature, sys.platform, _pkg_name_from_spec(spec)))
+    if not module:
+        return False
+    try:
+        return importlib.util.find_spec(module) is None
+    except (ImportError, AttributeError, ValueError):
+        return True
 
 
 # Spec validation: name[extras]specifier only — no URLs, paths, or shell metachars.
@@ -569,7 +584,7 @@ def _after_successful_install(specs: tuple[str, ...], target: Optional[Path], dr
 
 
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_lines: tuple[str, ...] = (),
-                      dry_run: bool = False) -> _InstallResult:
+                      dry_run: bool = False, force_reinstall: bool = False) -> _InstallResult:
     """Install ``specs`` via the uv -> pip -> ensurepip ladder, venv-scoped or into the durable
     ``--target`` (constrained to core versions) when :data:`_LAZY_TARGET_ENV` is set. Independent of
     ``hermes_cli.tools_config._pip_install`` (no CLI dependency).
@@ -611,7 +626,12 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
                 if pip_index_url:
                     uv_env["UV_INDEX_URL"] = pip_index_url
             try:
-                r = _run_installer([uv_bin, "pip", "install", "--compile-bytecode", *extra_args, *specs], timeout=timeout, env=uv_env)
+                uv_reinstall = ["--reinstall"] if force_reinstall and not dry_run else []
+                r = _run_installer(
+                    [uv_bin, "pip", "install", "--compile-bytecode", *uv_reinstall, *extra_args, *specs],
+                    timeout=timeout,
+                    env=uv_env,
+                )
                 if r.returncode != 0:
                     logger.debug("uv pip install failed: %s", r.stderr)
                 # A uv resolver failure is authoritative: falling through to pip would discard uv
@@ -640,7 +660,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 return _InstallResult(False, "", f"pip not available and ensurepip failed: {e}")
         try:
-            return _finish(_run_installer(pip_cmd + ["install", *extra_args, *specs], timeout=timeout))
+            pip_reinstall = ["--force-reinstall", "--ignore-installed"] if force_reinstall and not dry_run else []
+            return _finish(
+                _run_installer(pip_cmd + ["install", *pip_reinstall, *extra_args, *specs], timeout=timeout)
+            )
         except subprocess.TimeoutExpired as e:
             return _InstallResult(False, "", f"pip install timed out: {e}")
         except Exception as e:
@@ -655,7 +678,10 @@ def feature_missing(feature: str) -> tuple[str, ...]:
     """Return the subset of specs for ``feature`` not currently installed."""
     if feature not in LAZY_DEPS:
         raise KeyError(f"Unknown lazy feature: {feature!r}")
-    return tuple(s for s in _feature_specs(feature) if not _is_satisfied(s))
+    return tuple(
+        spec for spec in _feature_specs(feature)
+        if not _is_satisfied(spec) or _required_import_missing(feature, spec)
+    )
 
 
 def _prompt_toolkit_active() -> bool:
@@ -708,7 +734,8 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
         if answer and answer not in {"y", "yes"}:
             raise FeatureUnavailable(feature, missing, "user declined install at prompt")
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
-    result = _venv_pip_install(missing)
+    force_reinstall = any(_required_import_missing(feature, spec) for spec in missing)
+    result = _venv_pip_install(missing, force_reinstall=force_reinstall)
     if not result.success:  # surface pip's own error (quarantine 404, network), tail-clipped
         snippet = (result.stderr or result.stdout or "").strip()[-2000:]
         raise FeatureUnavailable(feature, missing, f"pip install failed: {snippet or 'no error output'}")

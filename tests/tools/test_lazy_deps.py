@@ -81,6 +81,13 @@ class TestAllowlist:
         monkeypatch.setattr(ld.sys, "platform", "linux")
         assert "pywin32==311" not in ld.feature_specs("tool.computer_use")
 
+    def test_computer_use_requires_importable_pywintypes_on_windows(self, monkeypatch):
+        monkeypatch.setattr(ld.sys, "platform", "win32")
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: True)
+        monkeypatch.setattr(ld.importlib.util, "find_spec", lambda module: None)
+
+        assert ld.feature_missing("tool.computer_use") == ("pywin32==311",)
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
@@ -161,6 +168,29 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_unimportable_windows_runtime_forces_local_reinstall(self, monkeypatch):
+        monkeypatch.setattr(ld.sys, "platform", "win32")
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: True)
+        importable = {"pywintypes": False}
+        monkeypatch.setattr(
+            ld.importlib.util,
+            "find_spec",
+            lambda module: object() if importable.get(module, True) else None,
+        )
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        calls = []
+
+        def fake_install(specs, **kwargs):
+            calls.append((specs, kwargs))
+            importable["pywintypes"] = True
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        ld.ensure("tool.computer_use", prompt=False)
+
+        assert calls == [(("pywin32==311",), {"force_reinstall": True})]
 
 
 # ---------------------------------------------------------------------------
