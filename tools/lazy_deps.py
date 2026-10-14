@@ -328,6 +328,19 @@ def _activate_target_on_syspath(target: Path) -> None:
     _invalidate_import_caches()
 
 
+def _activate_current_site_packages() -> None:
+    """Process newly installed ``.pth`` files without requiring a restart.
+
+    Pip can add import paths through ``.pth`` files after this interpreter has
+    already initialized ``site``.  pywin32 uses that mechanism for
+    ``pywintypes``; re-running ``addsitedir`` makes a successful lazy install
+    usable by the current computer-use invocation.
+    """
+    for path in site.getsitepackages():
+        site.addsitedir(path)
+    _invalidate_import_caches()
+
+
 def _invalidate_import_caches() -> None:
     """Make just-installed dists visible to importers and importlib.metadata in this process."""
     with contextlib.suppress(Exception):
@@ -580,6 +593,8 @@ def _after_successful_install(specs: tuple[str, ...], target: Optional[Path], dr
         return
     if target is not None:
         _activate_target_on_syspath(target)
+    else:
+        _activate_current_site_packages()
     _warm_installed_bytecode(specs, target)
 
 

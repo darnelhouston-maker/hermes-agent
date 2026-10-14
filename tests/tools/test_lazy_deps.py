@@ -193,6 +193,23 @@ class TestEnsure:
         assert calls == [(("pywin32==311",), {"force_reinstall": True})]
 
 
+class TestPostInstallActivation:
+    def test_venv_install_reprocesses_new_pth_files(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(ld.site, "getsitepackages", lambda: ["/active/site-packages"])
+        monkeypatch.setattr(ld.site, "addsitedir", lambda path: calls.append(("site", path)))
+        monkeypatch.setattr(ld, "_invalidate_import_caches", lambda: calls.append(("invalidate", None)))
+        monkeypatch.setattr(ld, "_warm_installed_bytecode", lambda specs, target: calls.append(("warm", specs)))
+
+        ld._after_successful_install(("pywin32==311",), None, False)
+
+        assert calls == [
+            ("site", "/active/site-packages"),
+            ("invalidate", None),
+            ("warm", ("pywin32==311",)),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # is_available
 # ---------------------------------------------------------------------------
