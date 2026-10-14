@@ -2403,9 +2403,10 @@ def _full_skill_view_result(message: dict, requested_name: str) -> str | None:
     content = message.get("content")
     if not isinstance(content, str):
         return None
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
+    from agent.tool_result_classification import parse_json_tool_result
+
+    payload = parse_json_tool_result(content, allow_host_annotations=True)
+    if payload is None:
         return None
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None

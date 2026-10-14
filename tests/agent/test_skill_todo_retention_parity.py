@@ -22,6 +22,7 @@ Invariants covered:
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -96,7 +97,7 @@ class TestPrunedSkillReloadNotice:
     )
 
     @staticmethod
-    def _skill_reload(call_id, requested_name, *, result_name=None, **overrides):
+    def _skill_reload(call_id, requested_name, *, result_name=None, annotation="", **overrides):
         payload = {
             "success": True,
             "name": result_name or requested_name.split(":")[-1].split("/")[-1],
@@ -121,7 +122,7 @@ class TestPrunedSkillReloadNotice:
                 "role": "tool",
                 "tool_name": "skill_view",
                 "tool_call_id": call_id,
-                "content": json.dumps(payload),
+                "content": json.dumps(payload) + annotation,
             },
         ]
 
@@ -138,6 +139,56 @@ class TestPrunedSkillReloadNotice:
             rows.extend(self._skill_reload(f"call-{index}", requested, result_name=name))
         assert _unresolved_pruned_skill_names(rows) == []
         assert _pruned_skill_reload_notice(rows) == ""
+
+    def test_qualified_mixed_order_reload_with_host_annotations_clears_notice(self):
+        skills = (
+            "imap-smtp-email",
+            "email-inbox-triage",
+            "clinical-send-preflight-gates",
+        )
+        qualified = {
+            "imap-smtp-email": "openclaw-imports:imap-smtp-email",
+            "email-inbox-triage": "email:email-inbox-triage",
+            "clinical-send-preflight-gates": "healthcare:clinical-send-preflight-gates",
+        }
+        warning = (
+            "\n\n[Tool loop warning: idempotent_no_progress_warning; count=2; "
+            "skill_view returned the same result 2 times.]"
+        )
+        for order in itertools.permutations(skills):
+            rows = [{"role": "user", "content": "\n".join(
+                _skill_pruned_marker(name) for name in skills
+            )}]
+            for index, name in enumerate(order):
+                requested = qualified[name] if index % 2 == 0 else name
+                rows.extend(self._skill_reload(
+                    f"call-{index}", requested, result_name=name, annotation=warning,
+                ))
+            assert _unresolved_pruned_skill_names(rows) == []
+            assert _pruned_skill_reload_notice(rows) == ""
+
+    def test_unknown_result_suffix_remains_fail_closed(self):
+        skill = self.REQUIRED_RECOVERY_SKILLS[0]
+        rows = [
+            {"role": "user", "content": _skill_pruned_marker(skill)},
+            *self._skill_reload("unknown-tail", skill, annotation="\n\nuntrusted suffix"),
+        ]
+        assert _unresolved_pruned_skill_names(rows) == [skill]
+
+    def test_annotated_reload_survives_restart_serialization(self):
+        skill = self.REQUIRED_RECOVERY_SKILLS[0]
+        rows = [
+            {"role": "user", "content": _skill_pruned_marker(skill)},
+            *self._skill_reload(
+                "restart", f"productivity:{skill}", result_name=skill,
+                annotation=(
+                    "\n\n[SYSTEM NOTICE — iteration budget checkpoint] You have used "
+                    "7 of 8 iterations. Checkpoint durable progress now."
+                ),
+            ),
+        ]
+        reloaded = json.loads(json.dumps(rows))
+        assert _unresolved_pruned_skill_names(reloaded) == []
 
     def test_each_missing_required_skill_remains_fail_closed(self):
         for missing in self.REQUIRED_RECOVERY_SKILLS:

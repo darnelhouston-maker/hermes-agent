@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -30,13 +31,55 @@ def tool_may_have_side_effect(tool_name: str) -> bool:
 GUARDRAIL_REFUSAL_KEY = "guardrail_refusal"
 
 
+_HOST_TOOL_RESULT_ANNOTATIONS = (
+    re.compile(r"\[Tool loop (?:warning|hard stop):[^\r\n]*\]"),
+    re.compile(r"\[SYSTEM NOTICE — run time budget nearly exhausted\] [^\r\n]*"),
+    re.compile(r"\[SYSTEM NOTICE — iteration budget checkpoint\] [^\r\n]*"),
+)
+
+
+def _trusted_host_annotation_suffix(value: str) -> bool:
+    """True when *value* contains only Hermes-owned result annotations.
+
+    Runtime guardrails and budget notices are appended after a tool's original
+    result.  They are not part of that tool's JSON contract, but trusted
+    classifiers still need the original payload.  Unknown trailing text stays
+    fail-closed.
+    """
+    paragraphs = [part.strip() for part in value.strip().split("\n\n") if part.strip()]
+    return bool(paragraphs) and all(
+        any(pattern.fullmatch(paragraph) for pattern in _HOST_TOOL_RESULT_ANNOTATIONS)
+        for paragraph in paragraphs
+    )
+
+
+def parse_json_tool_result(result: Any, *, allow_host_annotations: bool = False) -> Any:
+    """Parse one JSON tool result, optionally accepting trusted Hermes postludes.
+
+    ``None`` means the result is not an admissible JSON payload.  The decoder
+    consumes exactly one leading JSON value; arbitrary suffixes never pass.
+    """
+    if not isinstance(result, str):
+        return None
+    candidate = result.lstrip()
+    try:
+        payload, end = json.JSONDecoder().raw_decode(candidate)
+    except (TypeError, ValueError):
+        return None
+    suffix = candidate[end:]
+    if suffix.strip() and not (
+        allow_host_annotations and _trusted_host_annotation_suffix(suffix)
+    ):
+        return None
+    return payload
+
+
 def is_guardrail_refusal(result: Any) -> bool:
     """Return True when ``result`` (JSON string or parsed dict) is a harness refusal."""
     data = result
     if isinstance(result, str):
-        try:
-            data = json.loads(result.strip())
-        except Exception:
+        data = parse_json_tool_result(result, allow_host_annotations=True)
+        if data is None:
             return False
     return isinstance(data, dict) and data.get(GUARDRAIL_REFUSAL_KEY) is True
 
@@ -45,9 +88,8 @@ def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
     """Return True when a file mutation result proves the write landed."""
     if tool_name not in FILE_MUTATING_TOOL_NAMES or not isinstance(result, str):
         return False
-    try:
-        data = json.loads(result.strip())
-    except Exception:
+    data = parse_json_tool_result(result, allow_host_annotations=True)
+    if data is None:
         return False
     if not isinstance(data, dict) or data.get("error"):
         return False
