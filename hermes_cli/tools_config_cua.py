@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from hermes_cli.cli_output import (
     print_info as _print_info, print_success as _print_success, print_warning as _print_warning)
@@ -310,6 +310,8 @@ def install_cua_driver(upgrade: bool = False, require_confirmed_update: bool = F
             # next step is the manual elevated command.
             _print_warning("    cua-driver is compatible; its logon auto-start was not registered.")
             _print_info("    From an elevated shell, run: cua-driver autostart enable")
+        if is_windows and not _install_computer_use_readiness_canary_windows(verbose=False):
+            _print_warning("    Computer Use readiness canary could not be registered.")
         _print_cua_platform_notes(is_windows, is_linux, fresh_install=False)
         return True
     if repair_existing:
@@ -503,15 +505,37 @@ def _ps_single_quote(value: str) -> str:
 
 
 def _cua_driver_autostart_registered_windows() -> bool:
-    """Return whether the Windows cua-driver scheduled task is registered."""
+    """Return whether the Windows task exists and its executable still exists."""
+    return bool(_cua_driver_autostart_status_windows().get("target_exists"))
+
+
+def _cua_driver_autostart_status_windows(driver_cmd: str = "") -> Dict[str, Any]:
+    """Bounded metadata for the Windows logon task; task presence alone is not readiness."""
     if sys.platform != "win32":
-        return False
+        return {"registered": False, "target": None, "target_exists": False, "matches_driver": False}
     try:
-        return subprocess.run(["schtasks.exe", "/Query", "/TN", "cua-driver-serve"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=10).returncode == 0
+        result = subprocess.run(["schtasks.exe", "/Query", "/TN", "cua-driver-serve", "/XML"],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=10, creationflags=_post_setup_no_window_flags())
     except Exception:
-        return False
+        return {"registered": False, "target": None, "target_exists": False, "matches_driver": False}
+    if result.returncode != 0:
+        return {"registered": False, "target": None, "target_exists": False, "matches_driver": False}
+    target = None
+    with contextlib.suppress(Exception):
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(result.stdout or "")
+        target = next((node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "Command"), None)
+    target = os.path.expandvars((target or "").strip().strip('"')) or None
+    target_exists = bool(target and os.path.isfile(target))
+    expected = shutil.which(driver_cmd) if driver_cmd else None
+    if driver_cmd and expected is None and os.path.isfile(driver_cmd):
+        expected = driver_cmd
+    matches = bool(target_exists and expected and os.path.normcase(os.path.realpath(target)) ==
+                   os.path.normcase(os.path.realpath(expected)))
+    return {"registered": True, "target": target, "target_exists": target_exists,
+            "matches_driver": matches if driver_cmd else target_exists}
 
 
 def _repair_cua_driver_autostart_windows(driver_cmd: str, *, verbose: bool) -> bool:
@@ -528,13 +552,21 @@ def _repair_cua_driver_autostart_windows(driver_cmd: str, *, verbose: bool) -> b
     interactive prompt instead of unwinding. ``CREATE_NO_WINDOW`` (stdlib ``windows_hide_flags``,
     the same seam every other spawn in this module uses) keeps stdio as pipes so the failure text
     is still reported; the OS-owned UAC consent UI is unaffected."""
-    if sys.platform != "win32" or _cua_driver_autostart_registered_windows():
+    if sys.platform != "win32":
         return True
     binary = shutil.which(driver_cmd)
+    if binary is None and os.path.isfile(driver_cmd):
+        binary = driver_cmd
     if not binary:
         return False
+    status = _cua_driver_autostart_status_windows(binary)
+    if status.get("target_exists") and status.get("matches_driver"):
+        return True
     ps = shutil.which("powershell") or shutil.which("powershell.exe") or "powershell"
-    ps_cmd = (f"$exe = {_ps_single_quote(binary)}; "
+    disable = ("$old = Start-Process -FilePath $exe -ArgumentList @('autostart','disable') "
+               "-Verb RunAs -Wait -PassThru -ErrorAction Stop; "
+               "if ($old.ExitCode -ne 0) { exit $old.ExitCode }; ") if status.get("registered") else ""
+    ps_cmd = (f"$exe = {_ps_single_quote(binary)}; {disable}"
               "$proc = Start-Process -FilePath $exe -ArgumentList @('autostart','enable') "
               "-Verb RunAs -Wait -PassThru -ErrorAction Stop; exit $proc.ExitCode")
     _print_info("    Registering cua-driver auto-start..." if verbose
@@ -554,6 +586,30 @@ def _repair_cua_driver_autostart_windows(driver_cmd: str, *, verbose: bool) -> b
     _print_output_tail(result)
     _print_info("    From an elevated shell, run: cua-driver autostart enable")
     return False
+
+
+def _install_computer_use_readiness_canary_windows(*, verbose: bool) -> bool:
+    """Register the canonical 15-minute no-action readiness parity probe."""
+    if sys.platform != "win32":
+        return True
+    script = Path(__file__).resolve().parents[1] / "scripts" / "install-computer-use-readiness-canary.ps1"
+    canary = Path(__file__).resolve().parents[1] / "scripts" / "computer_use_readiness_canary.py"
+    if not script.is_file() or not canary.is_file():
+        return False
+    ps = shutil.which("powershell") or shutil.which("powershell.exe") or "powershell"
+    from hermes_constants import get_hermes_home
+
+    command = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+               "-PythonExe", sys.executable, "-ScriptPath", str(canary),
+               "-HermesHome", str(get_hermes_home())]
+    if verbose:
+        _print_info("    Registering Computer Use readiness canary...")
+    try:
+        result = _run_text(command, timeout=60, env=_cua_driver_env(),
+                           creationflags=_post_setup_no_window_flags())
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _remove_quietly(path: str) -> None:
@@ -782,6 +838,8 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True,
             if is_windows and not _repair_cua_driver_autostart_windows(installed_binary,
                                                                         verbose=verbose):
                 _print_warning("    cua-driver installed, but auto-start was not registered.")
+            if is_windows and not _install_computer_use_readiness_canary_windows(verbose=verbose):
+                _print_warning("    cua-driver installed, but readiness canary was not registered.")
             if verbose:
                 _print_success(f"    {driver_cmd} installed.")
                 _print_cua_platform_notes(is_windows, is_linux, fresh_install=True)

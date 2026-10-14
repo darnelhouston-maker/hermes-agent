@@ -42,6 +42,21 @@ def test_computer_use_help_omits_browser_approve() -> None:
     assert "permissions" in result.stdout
 
 
+def test_doctor_session_ready_flag_reaches_shared_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.computer_use import doctor
+
+    captured = {}
+
+    def run_doctor(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(doctor, "run_doctor", run_doctor)
+    assert _invoke(monkeypatch, "doctor", "--session-ready", "--json") == 0
+    assert captured["session_ready"] is True
+    assert captured["json_output"] is True
+
+
 def test_computer_use_rejects_removed_browser_approve_command() -> None:
     result = _run("browser-approve", "--pid", "123")
 

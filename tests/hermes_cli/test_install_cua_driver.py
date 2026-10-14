@@ -1525,21 +1525,25 @@ class TestWindowsAutostartRepair:
 
         calls = []
 
+        driver = r"C:\\current\\cua-driver.exe"
+        xml = ("<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'>"
+               f"<Actions><Exec><Command>{driver}</Command></Exec></Actions></Task>")
+
         def fake_run(cmd, **kwargs):
             calls.append((cmd, kwargs))
-            return SimpleNamespace(returncode=0)
+            return SimpleNamespace(returncode=0, stdout=xml, stderr="")
 
         with patch("subprocess.run", side_effect=fake_run), \
-             patch.object(tools_config.shutil, "which") as which:
+             patch.object(tools_config.shutil, "which", return_value=driver), \
+             patch.object(tools_config.os.path, "isfile", return_value=True):
             ok = tools_config._repair_cua_driver_autostart_windows(
-                "cua-driver", verbose=False
+                driver, verbose=False
             )
 
         assert ok is True
         assert [cmd for cmd, _kwargs in calls] == [
-            ["schtasks.exe", "/Query", "/TN", "cua-driver-serve"]
+            ["schtasks.exe", "/Query", "/TN", "cua-driver-serve", "/XML"]
         ]
-        which.assert_not_called()
 
     @pytest.mark.windows_only
     def test_windows_installer_runs_autostart_repair_after_success(self):

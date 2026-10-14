@@ -21,6 +21,21 @@ from tools.computer_use.cua_backend_parse import _extract_tool_result, _mcp_fiel
 logger = logging.getLogger("tools.computer_use.cua_backend")
 
 
+def _load_mcp_client() -> tuple[Any, Any, Any]:
+    """Import the optional MCP client behind a testable readiness boundary.
+
+    Windows' MCP package imports ``pywintypes`` during module initialization. A
+    partial Hermes environment can therefore have a healthy cua-driver binary
+    while the Python transport is unusable. Keep this import inside the
+    lifecycle error boundary so startup reports the real dependency failure
+    immediately instead of timing out with ``phase=unknown``.
+    """
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    return ClientSession, StdioServerParameters, stdio_client
+
+
 class _AsyncBridge:
     """Runs one asyncio loop on a daemon thread; marshals coroutines from the caller."""
 
@@ -201,6 +216,9 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        self._startup_phase = "not-started"
+        self._startup_timeout_seconds = 30.0
+        self._lifecycle_done_event = threading.Event()
         # Declared via start_session; revives an ended-session rejection non-re-entrantly.
         # Stable driver-side identity declared through start_session. Used to revive a logical ended-session
         # rejection without recursive call_tool re-entry or backend-owned state (#71166).
@@ -210,18 +228,16 @@ class _CuaDriverSession:
     async def _lifecycle_coro(self) -> None:
         """Owns the stdio MCP contexts: open, signal ready, block on shutdown, clean up — all in one task."""
         import time as _time
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from tools.computer_use import cua_backend as _cb
-        from tools.environments.local import _sanitize_subprocess_env
 
         self._shutdown_event = asyncio.Event()  # built on the loop's own thread
         _t0 = _time.monotonic()
-        # Phase marker: the ready-timeout error reports HOW FAR a wedged startup got.
-        # Phase marker surfaced by the ready-timeout error (issue #57025): when startup wedges, the caller
-        # reports HOW FAR it got instead of an opaque "never reached ready".
-        self._startup_phase = "binary-check"
+        self._startup_phase = "python-mcp-import"
         try:
+            ClientSession, StdioServerParameters, stdio_client = _load_mcp_client()
+            from tools.computer_use import cua_backend as _cb
+            from tools.environments.local import _sanitize_subprocess_env
+
+            self._startup_phase = "binary-check"
             driver_cmd = _driver.resolve_cua_driver_cmd()
             if not driver_cmd:
                 raise RuntimeError(_driver.cua_driver_install_hint())
@@ -255,6 +271,7 @@ class _CuaDriverSession:
             # A session that dies for ANY reason must be re-enterable: the next call sees _started False and
             # rebuilds. Atomic bool write — stop() may hold _lock.
             self._session, self._started = None, False
+            self._lifecycle_done_event.set()
 
     # Reset _started so a session that dies for ANY reason (MCP connection drop, driver crash, unexpected
     # coro exit) is re-enterable: the next start()/call sees _started False and rebuilds the session instead
@@ -293,23 +310,34 @@ class _CuaDriverSession:
     def _start_lifecycle_locked(self) -> None:
         """Spawn the lifecycle owner and wait for ready. Caller holds self._lock."""
         self._ready_event = threading.Event()
+        self._lifecycle_done_event = threading.Event()
         self._setup_error = self._shutdown_event = None
+        if getattr(self, "_startup_phase", "not-started") in {"not-started", "ready"}:
+            self._startup_phase = "scheduled"
         # The future tracks the WHOLE lifecycle; readiness is signalled via _ready_event.
         loop = self._bridge._loop
         if loop is None:
             raise RuntimeError("cua-driver bridge not started")
         self._lifecycle_future = asyncio.run_coroutine_threadsafe(self._lifecycle_coro(), loop)
-        if not self._ready_event.wait(timeout=30.0):
+        startup_timeout = float(getattr(self, "_startup_timeout_seconds", 30.0))
+        if not self._ready_event.wait(timeout=startup_timeout):
             self._signal_shutdown_locked()
-            # Surface which startup phase wedged (issue #57025) — "doctor passes but the wrapper times out"
-            # reports are undiagnosable from a bare "never reached ready".
+            future = self._lifecycle_future
+            if future is not None and future.done():
+                with contextlib.suppress(BaseException):
+                    future.result()
+            elif future is not None:
+                future.cancel()
+            self._lifecycle_done_event.wait(timeout=5.0)
             from hermes_constants import display_hermes_home
             raise RuntimeError(
-                f"cua-driver session never reached ready (timeout 30s; stuck in phase: "
-                f"{getattr(self, '_startup_phase', 'unknown')}). Run `hermes computer-use doctor` and check "
+                f"cua-driver session never reached ready (timeout {startup_timeout:g}s; stuck in phase: "
+                f"{self._startup_phase}). Run `hermes computer-use doctor --session-ready` and check "
                 f"{display_hermes_home()}/logs/agent.log for the phase timings.")
         if self._setup_error is not None:
-            raise RuntimeError(f"cua-driver session setup failed: {self._setup_error}") from self._setup_error
+            raise RuntimeError(
+                f"cua-driver session setup failed in phase {self._startup_phase}: "
+                f"{type(self._setup_error).__name__}: {self._setup_error}") from self._setup_error
         self._transport_generation += 1
         if self._transport_generation > 1:
             self._notify_transport_reset()

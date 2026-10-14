@@ -275,6 +275,9 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         with contextlib.ExitStack() as rollback:  # a failed start stops the private daemon, then re-raises
             if self._embedded_daemon is not None:
                 rollback.callback(self._embedded_daemon.stop) and self._embedded_daemon.start()
+            # Session.start() owns lifecycle cancellation; the bridge still needs closing when startup fails
+            # before this backend reaches the shared cache.
+            rollback.callback(self._bridge.stop)
             self._session.start()
             rollback.pop_all()
         # Declare this run's identity. Non-fatal: cua-driver accepts anonymous calls (cursor won't render), so degrade.

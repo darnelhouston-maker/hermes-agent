@@ -217,6 +217,18 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.trace_upload": ("huggingface-hub==1.24.0",),
 }
 
+# Platform supplements stay outside LAZY_DEPS because that manifest is parsed by
+# AST-based packaging tests. MCP 2.x imports pywintypes on Windows even for the
+# client-only stdio transport; partial/older venvs can therefore carry mcp while
+# remaining unable to start computer_use.
+_PLATFORM_LAZY_DEPS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("tool.computer_use", "win32"): ("pywin32==311",),
+}
+
+
+def _feature_specs(feature: str) -> tuple[str, ...]:
+    return LAZY_DEPS[feature] + _PLATFORM_LAZY_DEPS.get((feature, sys.platform), ())
+
 
 # Spec validation: name[extras]specifier only — no URLs, paths, or shell metachars.
 _NAME_RE = r"[A-Za-z0-9_][A-Za-z0-9_.\-]*"
@@ -643,7 +655,7 @@ def feature_missing(feature: str) -> tuple[str, ...]:
     """Return the subset of specs for ``feature`` not currently installed."""
     if feature not in LAZY_DEPS:
         raise KeyError(f"Unknown lazy feature: {feature!r}")
-    return tuple(s for s in LAZY_DEPS[feature] if not _is_satisfied(s))
+    return tuple(s for s in _feature_specs(feature) if not _is_satisfied(s))
 
 
 def _prompt_toolkit_active() -> bool:
@@ -716,7 +728,7 @@ def feature_install_command(feature: str, *, venv_pip: bool = False) -> Optional
     — immune to PEP 668 failures a bare ``pip install`` invites."""
     if feature not in LAZY_DEPS:
         return None
-    joined = " ".join(repr(s) for s in LAZY_DEPS[feature])
+    joined = " ".join(repr(s) for s in _feature_specs(feature))
     return f"{sys.executable} -m pip install {joined}" if venv_pip else "uv pip install " + joined
 
 
@@ -833,5 +845,5 @@ def feature_specs(feature: str) -> tuple[str, ...]:
     """Return the registered specs for a feature, or raise KeyError."""
     if feature not in LAZY_DEPS:
         raise KeyError(f"Unknown lazy feature: {feature!r}")
-    return LAZY_DEPS[feature]
+    return _feature_specs(feature)
 # ---- END PLUGIN-COMPAT ----

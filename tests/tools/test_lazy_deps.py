@@ -75,6 +75,12 @@ class TestSpecSafety:
 
 
 class TestAllowlist:
+    def test_computer_use_adds_pywin32_only_on_windows(self, monkeypatch):
+        monkeypatch.setattr(ld.sys, "platform", "win32")
+        assert "pywin32==311" in ld.feature_specs("tool.computer_use")
+        monkeypatch.setattr(ld.sys, "platform", "linux")
+        assert "pywin32==311" not in ld.feature_specs("tool.computer_use")
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):

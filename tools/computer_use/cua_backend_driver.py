@@ -84,7 +84,8 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     home = os.path.expanduser("~")
     if sys.platform == "win32":
         local_app_data = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
-        return [_CUA_DRIVER_DEFAULT_CMD, os.path.join(local_app_data, "Programs", "Cua", "cua-driver", "bin", "cua-driver.exe"),
+        return [_CUA_DRIVER_DEFAULT_CMD, os.path.join(home, ".cua-driver", "packages", "current", "cua-driver.exe"),
+                os.path.join(local_app_data, "Programs", "Cua", "cua-driver", "bin", "cua-driver.exe"),
                 os.path.join(home, ".local", "bin", "cua-driver.exe"), os.path.join(home, ".local", "bin", "cua-driver")]
     return [_CUA_DRIVER_DEFAULT_CMD, os.path.join(home, ".local", "bin", "cua-driver"),
             os.path.join(home, ".cargo", "bin", "cua-driver"), "/opt/homebrew/bin/cua-driver", "/usr/local/bin/cua-driver"]
