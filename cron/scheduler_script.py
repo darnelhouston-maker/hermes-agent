@@ -368,8 +368,19 @@ def _run_job_script(
         # the sanitizer then overlays the names the owning profile declares in
         # terminal.env_passthrough from its own secret scope (#114209). The factory snapshots the
         # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
-        env = build_subprocess_env(strip_launch_profile=True)
-        env.update(env_overlay)
+        # Script-only and pre-run children precede agent setup. Bind only this
+        # scheduler-owned capability while the sanitizer projects session context;
+        # restore it before spawning so other threads/interactive turns are unchanged.
+        from gateway.session_context import _VAR_MAP
+        cron_session = _VAR_MAP["HERMES_CRON_SESSION"]
+        token = cron_session.set("1")
+        try:
+            env = build_subprocess_env(
+                strip_launch_profile=True,
+                extra={**env_overlay, "HERMES_CRON_SESSION": "1"},
+            )
+        finally:
+            cron_session.reset(token)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
