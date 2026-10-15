@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 from hermes_cli.cli_output import (
@@ -97,9 +98,11 @@ def _cua_driver_install_ready() -> bool:
     # On-demand default (#97389): with computer_use.autostart off, a missing
     # cua-driver-serve logon task is intentional, not a repair condition —
     # requiring it here biased every enable flow toward registering it.
-    return (sys.platform != "win32"
-            or _cua_driver_autostart_registered_windows()
-            or not _cua_autostart_opt_in())
+    return ((sys.platform != "win32"
+             or _cua_driver_autostart_registered_windows()
+             or not _cua_autostart_opt_in())
+            and (sys.platform != "win32"
+                 or _computer_use_readiness_canary_registered_windows()))
 
 
 def install_cua_driver(upgrade: bool = False, show_installer_progress: bool = True) -> bool:
@@ -139,6 +142,9 @@ def install_cua_driver(upgrade: bool = False, show_installer_progress: bool = Tr
     if sys.platform == "win32" and not _repair_cua_driver_autostart_windows(
             binary, verbose=show_installer_progress):
         return _fail("    cua-driver is compatible, but Windows autostart setup failed.")
+    if sys.platform == "win32" and not _install_computer_use_readiness_canary_windows(
+            verbose=show_installer_progress):
+        return _fail("    cua-driver is compatible, but the Windows readiness canary setup failed.")
     if sys.platform == "darwin":
         from tools.computer_use.cua_backend_daemon import (
             _resolve_cua_driver_app_path, _validate_cua_driver_app_signature)
@@ -254,6 +260,89 @@ def _repair_cua_driver_autostart_windows(driver_cmd: str, *, verbose: bool) -> b
     _print_output_tail(result)
     _print_info(f"    From an elevated shell, run: & {_ps_single_quote(binary)} autostart enable")
     return False
+
+
+def _canonical_windows_launcher() -> Optional[Path]:
+    if sys.platform != "win32":
+        return None
+    from hermes_constants import get_default_hermes_root
+
+    root = Path(get_default_hermes_root()) / "bin"
+    return next((path for path in (root / "hermes.exe", root / "hermes.cmd") if path.is_file()), None)
+
+
+def _computer_use_readiness_canary_registered_windows() -> bool:
+    """The recurring task must point at the stable runner and public launcher."""
+    if sys.platform != "win32":
+        return False
+    launcher = _canonical_windows_launcher()
+    if launcher is None:
+        return False
+    from hermes_constants import get_default_hermes_root
+    from xml.etree import ElementTree
+
+    stable_runner = Path(get_default_hermes_root()) / "scripts" / "computer-use-readiness-canary-task.ps1"
+    if not stable_runner.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", "HermesComputerUseReadinessCanary", "/XML"],
+            capture_output=True,
+            timeout=10,
+            creationflags=_post_setup_no_window_flags(),
+            check=False,
+        )
+        if result.returncode:
+            return False
+        task = ElementTree.fromstring(result.stdout)
+        arguments = " ".join((node.text or "") for node in task.findall(".//{*}Exec/{*}Arguments"))
+        normalized = os.path.normcase(arguments.replace('"', ""))
+        return (os.path.normcase(str(stable_runner)) in normalized
+                and os.path.normcase(str(launcher)) in normalized)
+    except (OSError, subprocess.SubprocessError, ElementTree.ParseError):
+        return False
+
+
+def _install_computer_use_readiness_canary_windows(*, verbose: bool) -> bool:
+    """Register the canonical 15-minute, no-action readiness parity probe."""
+    if sys.platform != "win32":
+        return True
+    launcher = _canonical_windows_launcher()
+    root = Path(__file__).resolve().parents[1]
+    installer = root / "scripts" / "install-computer-use-readiness-canary.ps1"
+    runner = root / "scripts" / "run-computer-use-readiness-canary.ps1"
+    if launcher is None or not installer.is_file() or not runner.is_file():
+        return False
+    ps = shutil.which("powershell") or shutil.which("powershell.exe") or "powershell"
+    from hermes_constants import get_default_hermes_root
+
+    command = [
+        ps,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(installer),
+        "-HermesExe",
+        str(launcher),
+        "-RunnerPath",
+        str(runner),
+        "-HermesHome",
+        str(get_default_hermes_root()),
+    ]
+    if verbose:
+        _print_info("    Registering Computer Use readiness canary...")
+    try:
+        result = _run_text(
+            command,
+            timeout=60,
+            env=_cua_driver_env(),
+            creationflags=_post_setup_no_window_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and _computer_use_readiness_canary_registered_windows()
 
 
 def _print_cua_platform_notes(is_windows: bool, is_linux: bool, *, fresh_install: bool) -> None:

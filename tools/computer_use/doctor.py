@@ -12,6 +12,7 @@ import platform as _platform_mod
 import re
 import subprocess
 import sys
+import time
 from contextlib import contextmanager, suppress
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -41,6 +42,138 @@ _Row = tuple[str, str, Report]  # (status, message, extra {hint?, data?}) for on
 
 class HealthReportUnavailable(RuntimeError):
     """health_report denied or non-schema payload — ``run_doctor`` falls back to probes."""
+
+
+def _bounded_error(exc: BaseException, limit: int = 240) -> str:
+    """Return one bounded line suitable for metadata-only health output."""
+    text = " ".join(str(exc).split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _python_mcp_client_check() -> Report:
+    """Exercise the same import seam the live Computer Use session uses."""
+    try:
+        from tools.computer_use.cua_backend_session import _load_mcp_client
+
+        _load_mcp_client()
+    except Exception as exc:
+        return {
+            "name": "python_mcp_client",
+            "status": "fail",
+            "message": (
+                "Hermes MCP client import failed: "
+                f"{type(exc).__name__}: {_bounded_error(exc)}"
+            ),
+            "hint": (
+                "Repair the active Hermes environment, then re-run "
+                "`hermes computer-use doctor --session-ready`."
+            ),
+            "data": {
+                "phase": "python-mcp-import",
+                "error_class": type(exc).__name__,
+            },
+        }
+    return {
+        "name": "python_mcp_client",
+        "status": "pass",
+        "message": "Hermes MCP client imports successfully.",
+        "data": {"phase": "python-mcp-import"},
+    }
+
+
+def probe_tool_session_readiness(*, timeout: float = 30.0) -> Report:
+    """Open and close the real Hermes MCP session without reading or changing UI."""
+    from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
+
+    bridge = _AsyncBridge()
+    session = _CuaDriverSession(bridge)
+    session._startup_timeout_seconds = timeout
+    started = False
+    error: Optional[BaseException] = None
+    began = time.monotonic()
+    try:
+        session.start()
+        started = True
+    except Exception as exc:
+        error = exc
+    finally:
+        cleanup_errors: list[str] = []
+        try:
+            session.stop()
+        except Exception as exc:
+            cleanup_errors.append(type(exc).__name__)
+        try:
+            bridge.stop()
+        except Exception as exc:
+            cleanup_errors.append(type(exc).__name__)
+
+    elapsed_ms = round((time.monotonic() - began) * 1000)
+    phase = str(session._startup_phase or "not-started")
+    lifecycle_done = session._lifecycle_done_event.is_set()
+    if cleanup_errors:
+        cleanup = "failed:" + ",".join(cleanup_errors)
+    else:
+        cleanup = "complete" if lifecycle_done else "incomplete"
+    if started and error is None and phase == "ready" and cleanup == "complete":
+        return {
+            "ready": True,
+            "phase": phase,
+            "elapsed_ms": elapsed_ms,
+            "cleanup": cleanup,
+            "error_class": None,
+            "reason": None,
+        }
+    return {
+        "ready": False,
+        "phase": phase,
+        "elapsed_ms": elapsed_ms,
+        "cleanup": cleanup,
+        "error_class": type(error).__name__ if error is not None else None,
+        "reason": _bounded_error(error) if error is not None else "session did not reach ready",
+    }
+
+
+def _apply_hermes_readiness_contract(report: Report, *, session_ready: bool) -> Report:
+    """Add Hermes-side readiness without changing cua-driver's native fields."""
+    augmented = {**report, "hermes_checks": []}
+    python_check = _python_mcp_client_check()
+    augmented["hermes_checks"].append(python_check)
+    readiness = None
+    if session_ready and python_check["status"] == "pass":
+        readiness = probe_tool_session_readiness()
+        augmented["hermes_checks"].append({
+            "name": "tool_session_ready",
+            "status": "pass" if readiness["ready"] else "fail",
+            "message": (
+                "Hermes Computer Use session reached ready and cleaned up."
+                if readiness["ready"] else
+                f"Hermes session failed in phase {readiness['phase']}: {readiness['reason']}"
+            ),
+            "data": readiness,
+        })
+    elif session_ready:
+        readiness = {
+            "ready": False,
+            "phase": "python-mcp-import",
+            "elapsed_ms": 0,
+            "cleanup": "not-started",
+            "error_class": python_check["data"]["error_class"],
+            "reason": python_check["message"],
+        }
+        augmented["hermes_checks"].append({
+            "name": "tool_session_ready",
+            "status": "fail",
+            "message": "Session probe was not started because the Python MCP client is unavailable.",
+            "data": readiness,
+        })
+    augmented["hermes_driver_overall"] = report.get("overall")
+    if readiness is not None:
+        augmented["hermes_session_readiness"] = readiness
+    augmented["hermes_overall"] = (
+        "failed" if any(check.get("status") == "fail" for check in augmented["hermes_checks"])
+        else report.get("overall")
+    )
+    return augmented
 
 def _run_cli(binary: str, *args: str, timeout: float) -> subprocess.CompletedProcess:
     """Run ``<binary> args`` with UTF-8 capture + sanitized env (raises on failure)."""
@@ -395,7 +528,8 @@ def _print_text_report(report: Report, color: bool, *, identity: Optional[Report
     """Render like `cua-driver call health_report`: header (CLI --version preferred over health_report's stale
     ``driver_version``), identity block, environment note, one line per check + indented hint/``data`` rows
     (support staff need them)."""
-    platform, report_v, overall = (report.get(k, "?") for k in ("platform", "driver_version", "overall"))
+    platform, report_v = (report.get(k, "?") for k in ("platform", "driver_version"))
+    overall = report.get("hermes_overall") or report.get("overall", "?")
     identity = identity or {}
     cli_v = identity.get("cli_version") or ""
     header_v = cli_v or report_v  # binary's own --version wins when health_report is stale
@@ -414,7 +548,7 @@ def _print_text_report(report: Report, color: bool, *, identity: Optional[Report
     if identity.get("version_mismatch"):
         lines += [f"  {yellow}⚠️ version mismatch: health_report says {report_v!r} but binary --version is {cli_v!r}{reset}",
                   f"  {dim}→ trust --version / packages/current for debugging; health_report's binary_version check can lag on Windows{reset}"]
-    for check in report.get("checks", []):
+    for check in [*report.get("checks", []), *report.get("hermes_checks", [])]:
         status = check.get("status", "?")
         lines.append(f"  {_STATUS_GLYPH.get(status, '•')} {status_cols.get(status, '')}{check.get('name', '?')}{reset}: {check.get('message') or ''}")
         if check.get("hint"):
@@ -425,7 +559,7 @@ def _print_text_report(report: Report, color: bool, *, identity: Optional[Report
     print("\n".join(lines))
 
 def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (), skip: Sequence[str] = (), json_output: bool = False,
-               color: Optional[bool] = None) -> int:
+               color: Optional[bool] = None, session_ready: bool = False) -> int:
     """Resolve the binary via the shared runtime resolver (diagnose what `computer_use` actually invokes), call
     `health_report`, render; on 0.10.x (denied) a report is synthesized from probes."""
     # Windows' locale codec (cp1252, cp936, ...) cannot encode the ✅ ❌ ⚠️ ⏭️ glyphs — force UTF-8.
@@ -458,6 +592,7 @@ def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (),
     report = _apply_stale_tcc_guard(report)
     report = _apply_stale_unit_guard(report)
     report = _apply_daemon_liveness_guard(report, binary)
+    report = _apply_hermes_readiness_contract(report, session_ready=session_ready)
     identity = _build_identity(binary, report)
     environment = _wayland_environment_context(report)
     if json_output:
@@ -471,4 +606,4 @@ def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (),
     else:
         _print_text_report(report, color=sys.stdout.isatty() if color is None else bool(color), identity=identity,
                            environment=environment)
-    return 0 if report.get("overall") == "ok" else 1  # unknown/missing overall must not look like success
+    return 0 if (report.get("hermes_overall") or report.get("overall")) == "ok" else 1

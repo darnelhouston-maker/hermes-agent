@@ -45,6 +45,21 @@ def test_computer_use_status_returns_nonzero_when_driver_is_missing(monkeypatch,
     assert "cua-driver: not installed" in capsys.readouterr().out
 
 
+def test_doctor_session_ready_flag_reaches_shared_contract(monkeypatch):
+    from tools.computer_use import doctor
+
+    captured = {}
+
+    def run_doctor(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(doctor, "run_doctor", run_doctor)
+    assert _invoke(monkeypatch, "doctor", "--session-ready", "--json") == 0
+    assert captured["session_ready"] is True
+    assert captured["json_output"] is True
+
+
 @pytest.mark.parametrize("override", [False, True])
 def test_computer_use_status_reports_unusable_driver(monkeypatch, capsys, tmp_path, override):
     from hermes_cli import tools_config_cua as cua
