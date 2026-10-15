@@ -379,6 +379,31 @@ function Get-PmStoreRoot {
     return (Join-Path $HermesHome "tools")
 }
 
+function Ensure-InteractiveRuntimeAcl {
+    # An elevated install can create the per-user PM store with an
+    # Administrators-only protected DACL. The install and `doctor` then work
+    # in that elevated session while ordinary desktop launches and logon
+    # Scheduled Tasks fail before Python can report a readiness phase. Give
+    # the installing user's SID Modify rights on this store only; keep every
+    # existing SYSTEM/Administrators rule and leave HERMES_HOME data alone.
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+    if ($script:InteractiveRuntimeAclReady) { return }
+
+    $store = Get-PmStoreRoot
+    New-Item -ItemType Directory -Force -Path $store | Out-Null
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($null -eq $identity.User) {
+        Fail "cannot identify the Windows account that owns the Hermes runtime" runtime_acl_failed
+    }
+    $grant = "*$($identity.User.Value):(OI)(CI)(M)"
+    Invoke-Native { & icacls $store /grant:r $grant /T /C /Q } | Out-Null
+    if ($LASTEXITCODE) {
+        Fail "cannot make the Hermes runtime usable by the installing Windows account" runtime_acl_failed
+    }
+    $script:InteractiveRuntimeAclReady = $true
+    Write-Ok "Hermes runtime is accessible to interactive processes"
+}
+
 # The MACHINE's architecture (registry PROCESSOR_ARCHITECTURE), not the
 # interpreter's — an x64 powershell on Windows-on-ARM must stage arm64.
 function Get-WindowsArch {
@@ -1137,6 +1162,7 @@ function Get-BootstrapPython {
     # The full ladder runs every stage in one process and four of them need
     # this interpreter; resolve uv and Python once per process.
     if ($script:BootstrapPython) { return $script:BootstrapPython }
+    Ensure-InteractiveRuntimeAcl
     $uv = Get-Uv
     $lock = Get-Content (Join-Path $InstallDir "pm\lock.json") -Raw | ConvertFrom-Json
     $pyPin = $lock.packages.python
