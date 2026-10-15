@@ -136,6 +136,63 @@ def test_driver_and_delayed_tool_readiness_agree(monkeypatch):
     assert report["hermes_session_readiness"]["cleanup"] == "complete"
 
 
+def test_canary_records_the_resolved_driver_version(tmp_path, monkeypatch):
+    from hermes_cli import computer_use_readiness_canary as canary
+
+    payload = {
+        "driver_version": "0.22.1",
+        "hermes_driver_overall": "ok",
+        "hermes_identity": {"cli_version": "cua-driver 0.22.2"},
+        "hermes_session_readiness": {
+            "ready": True,
+            "phase": "ready",
+            "elapsed_ms": 17,
+            "cleanup": "complete",
+            "error_class": None,
+            "reason": None,
+        },
+    }
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    result = canary._probe("default", tmp_path, timeout=1)
+
+    assert result["ok"] is True
+    assert result["driver_version"] == "cua-driver 0.22.2"
+
+
+def test_canary_event_includes_bounded_readiness_identity(monkeypatch):
+    from hermes_cli import computer_use_readiness_canary as canary
+
+    calls = []
+    monkeypatch.setattr(canary.os, "name", "nt")
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append(args),
+    )
+
+    canary._event_log("mismatch", {
+        "profile": "default",
+        "phase": "python-mcp-import",
+        "driver_overall": "ok",
+        "driver_version": "cua-driver 0.22.2",
+        "cleanup": "complete",
+        "error_class": "ImportError",
+    })
+
+    message = calls[0][calls[0].index("/D") + 1]
+    assert "profile=default" in message
+    assert "phase=python-mcp-import" in message
+    assert "version=cua-driver 0.22.2" in message
+    assert "cleanup=complete" in message
+
+
 def test_canary_deduplicates_mismatch_and_emits_recovery(tmp_path, monkeypatch):
     from hermes_cli import computer_use_readiness_canary as canary
 

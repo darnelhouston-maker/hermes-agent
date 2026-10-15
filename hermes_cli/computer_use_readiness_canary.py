@@ -68,6 +68,12 @@ def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
         )
         payload = json.loads(result.stdout)
         readiness = payload.get("hermes_session_readiness") or {}
+        identity = payload.get("hermes_identity") or {}
+        driver_version = (
+            identity.get("cli_version")
+            or payload.get("driver_version")
+            or "unknown"
+        )
         ok = (
             result.returncode == 0
             and payload.get("hermes_driver_overall") == "ok"
@@ -78,6 +84,7 @@ def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
             "profile": profile,
             "ok": ok,
             "driver_overall": payload.get("hermes_driver_overall"),
+            "driver_version": driver_version,
             "phase": readiness.get("phase") or "not-reported",
             "elapsed_ms": readiness.get("elapsed_ms") or round((time.monotonic() - began) * 1000),
             "cleanup": readiness.get("cleanup") or "not-reported",
@@ -89,6 +96,7 @@ def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
             "profile": profile,
             "ok": False,
             "driver_overall": "unknown",
+            "driver_version": "unknown",
             "phase": "canary-timeout",
             "elapsed_ms": round((time.monotonic() - began) * 1000),
             "cleanup": "subprocess-terminated",
@@ -100,6 +108,7 @@ def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
             "profile": profile,
             "ok": False,
             "driver_overall": "unknown",
+            "driver_version": "unknown",
             "phase": "canary-protocol",
             "elapsed_ms": round((time.monotonic() - began) * 1000),
             "cleanup": "complete",
@@ -132,7 +141,9 @@ def _event_log(kind: str, result: dict[str, Any]) -> None:
     message = (
         f"Hermes computer-use readiness {kind}; host={socket.gethostname()}; "
         f"profile={result['profile']}; phase={result['phase']}; "
-        f"driver={result['driver_overall']}; cleanup={result['cleanup']}; "
+        f"driver={result['driver_overall']}; "
+        f"version={result.get('driver_version') or 'unknown'}; "
+        f"cleanup={result['cleanup']}; "
         f"error={result.get('error_class') or 'none'}"
     )
     try:
