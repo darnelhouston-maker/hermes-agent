@@ -79,7 +79,8 @@ def _cu_doctor(args) -> None:
     sys.exit(run_doctor(
         include=list(getattr(args, "include", []) or []),
         skip=list(getattr(args, "skip", []) or []),
-        json_output=bool(getattr(args, "json", False))))
+        json_output=bool(getattr(args, "json", False)),
+        session_ready=bool(getattr(args, "session_ready", False))))
 
 
 def _cu_perms_status(args) -> None:
@@ -164,6 +165,9 @@ def build_computer_use_parser(subparsers) -> None:
     computer_use_doctor.add_argument(
         "--skip", action="append", default=[], metavar="CHECK",
         help="Skip the listed checks. Repeat for multiple. Wins over --include.")
+    computer_use_doctor.add_argument(
+        "--session-ready", action="store_true",
+        help="Open and close a real no-action Hermes MCP session to compare tool readiness with driver health.")
     add_json_flag(computer_use_doctor,
                   "Emit the raw structured payload as JSON (same shape as `tools/call`).")
     computer_use_perms = computer_use_sub.add_parser(

@@ -185,6 +185,7 @@ def test_install_ready_task_requirement_follows_the_opt_in(monkeypatch, opt_in, 
     monkeypatch.setattr(cua, "_cua_driver_autostart_registered_windows",
                         lambda binary=None: False)
     monkeypatch.setattr(cua, "_cua_autostart_opt_in", lambda: opt_in)
+    monkeypatch.setattr(cua, "_computer_use_readiness_canary_registered_windows", lambda: True)
     assert cua._cua_driver_install_ready() is expected
 
 
@@ -198,6 +199,7 @@ def test_setup_preserves_host_registration_failure(monkeypatch, registered):
     monkeypatch.setattr(pm, "ensure", lambda *a, **kw: None)
     monkeypatch.setattr(cua, "_resolved_cua_driver_cmd", lambda: "cua-driver.exe")
     monkeypatch.setattr(cua, "_cua_driver_contract_status", lambda *a: {"ready": True})
+    monkeypatch.setattr(cua, "_install_computer_use_readiness_canary_windows", lambda **kwargs: True)
     with patch.object(cua, "_repair_cua_driver_autostart_windows", return_value=registered) as repair:
         assert cua.install_cua_driver(show_installer_progress=False) is registered
     repair.assert_called_once_with("cua-driver.exe", verbose=False)
