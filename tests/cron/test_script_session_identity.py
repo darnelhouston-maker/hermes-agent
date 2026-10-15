@@ -23,7 +23,8 @@ def test_scheduler_script_identity_survives_context_and_overlay(
 
     def conflicting_overlay(path):
         argv, overlay, error = original(path)
-        return argv, {**overlay, "HERMES_CRON_SESSION": "0"}, error
+        return argv, {**overlay, "HERMES_CRON_SESSION": "0",
+                      "VIRTUAL_ENV": "/synthetic/interpreter"}, error
 
     monkeypatch.setattr(script, "_script_argv", conflicting_overlay)
     try:
@@ -32,12 +33,12 @@ def test_scheduler_script_identity_survives_context_and_overlay(
             scripts.mkdir(parents=True, exist_ok=True)
             child = scripts / ("identity" + suffix)
             child.write_text(
-                "import os; print(os.environ.get('HERMES_CRON_SESSION', 'missing'))\n"
-                if suffix == ".py" else 'printf "%s\\n" "$HERMES_CRON_SESSION"\n'
+                "import os; print(os.environ.get('HERMES_CRON_SESSION', 'missing')+'|'+os.environ.get('VIRTUAL_ENV',''))\n"
+                if suffix == ".py" else 'printf "%s|%s\\n" "$HERMES_CRON_SESSION" "$VIRTUAL_ENV"\n'
             )
             with _profile_cron_scope(home):
                 ok, output = script._run_job_script(child.name)
-            assert (ok, output) == (True, "1")
+            assert (ok, output) == (True, "1|/synthetic/interpreter")
             assert marker.get() == parent_marker
             assert os.environ["HERMES_CRON_SESSION"] == "ambient-not-authority"
     finally:

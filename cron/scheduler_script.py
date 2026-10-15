@@ -377,10 +377,14 @@ def _run_job_script(
         try:
             env = build_subprocess_env(
                 strip_launch_profile=True,
-                extra={**env_overlay, "HERMES_CRON_SESSION": "1"},
+                extra={"HERMES_CRON_SESSION": "1"},
             )
         finally:
             cron_session.reset(token)
+        # The trusted Windows interpreter overlay must survive the runtime-marker
+        # scrub, but it cannot override scheduler ownership.
+        env.update({key: value for key, value in env_overlay.items()
+                    if key != "HERMES_CRON_SESSION"})
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
