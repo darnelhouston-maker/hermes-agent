@@ -248,6 +248,21 @@ def test_canary_registration_requires_stable_runner_and_launcher(tmp_path, monke
     assert cua._computer_use_readiness_canary_registered_windows()
 
 
+@pytest.mark.platforms("windows")
+def test_schtasks_utf8_output_with_utf16_declaration_is_accepted():
+    from hermes_cli import tools_config_cua as cua
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'>"
+        "<Actions><Exec><Command>powershell.exe</Command></Exec></Actions></Task>"
+    )
+
+    task = cua._parse_schtasks_xml_output(xml.encode("utf-8"))
+
+    assert task.tag.rsplit("}", 1)[-1] == "Task"
+
+
 def test_canary_runner_records_public_launcher_failure_without_ui_payload():
     root = Path(__file__).resolve().parents[2]
     body = (root / "scripts" / "run-computer-use-readiness-canary.ps1").read_text(encoding="utf-8")
