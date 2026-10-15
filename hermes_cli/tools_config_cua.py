@@ -55,6 +55,24 @@ def _cua_version_summary(raw: str, *, limit: int = 120) -> str:
     return next((line.strip()[:limit] for line in (raw or "").splitlines() if line.strip()), "")
 
 
+def _parse_schtasks_xml_output(raw: bytes):
+    """Parse ``schtasks /XML`` after decoding its real console byte stream.
+
+    Some Windows builds emit UTF-8 or an OEM code page while retaining an
+    ``encoding="UTF-16"`` XML declaration. Feeding those bytes directly to
+    ElementTree rejects a healthy task before path parity can be checked.
+    """
+    from xml.etree import ElementTree
+
+    from hermes_cli.gateway_windows import _decode_schtasks_output
+
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16")
+    else:
+        text = _decode_schtasks_output(raw)
+    return ElementTree.fromstring(text)
+
+
 def _resolved_cua_driver_cmd() -> Optional[str]:
     from tools.computer_use.cua_backend_driver import resolve_cua_driver_cmd
     return resolve_cua_driver_cmd()
@@ -189,8 +207,7 @@ def _cua_driver_autostart_registered_windows(binary: Optional[str] = None) -> bo
             capture_output=True, timeout=10, creationflags=_post_setup_no_window_flags(), check=False)
         if result.returncode:
             return False
-        # Parse bytes: schtasks' XML declaration carries the output encoding.
-        task = ElementTree.fromstring(result.stdout)
+        task = _parse_schtasks_xml_output(result.stdout)
         commands = task.findall(".//{*}Exec/{*}Command")
         return any(os.path.normcase((node.text or "").strip().strip('"')) == os.path.normcase(binary)
                    for node in commands)
@@ -294,7 +311,7 @@ def _computer_use_readiness_canary_registered_windows() -> bool:
         )
         if result.returncode:
             return False
-        task = ElementTree.fromstring(result.stdout)
+        task = _parse_schtasks_xml_output(result.stdout)
         arguments = " ".join((node.text or "") for node in task.findall(".//{*}Exec/{*}Arguments"))
         normalized = os.path.normcase(arguments.replace('"', ""))
         return (os.path.normcase(str(stable_runner)) in normalized
