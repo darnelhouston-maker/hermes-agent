@@ -137,7 +137,7 @@ def test_loaded_launchd_identity_is_independent_of_disk(configured, command, rea
 
 
 @pytest.mark.parametrize("case,reason", [
-    ("bound", None), ("utf16", None), ("native_defaults", None), ("wrong_home", "profile_mismatch"),
+    ("bound", None), ("utf16", None), ("console_xml", None), ("native_defaults", None), ("wrong_home", "profile_mismatch"),
     ("wrong_user", "service_account_mismatch"), ("missing_user", "service_identity_unverified"),
     ("extra_action", "service_identity_unverified"), ("disabled", "service_disabled"),
     ("noninteractive", "service_identity_unverified"),
@@ -182,6 +182,8 @@ def test_task_xml_binds_actual_action_and_principal(case, reason, tmp_path):
         xml = xml.replace('<Enabled>true</Enabled>', '<Enabled>false</Enabled>')
     if case == 'utf16':
         xml = xml.encode('utf-16')
+    if case == 'console_xml':
+        xml = xml.encode('utf-8')
     if case == 'malformed_xml':
         xml = '<Task>'
     if case == 'unknown_script':

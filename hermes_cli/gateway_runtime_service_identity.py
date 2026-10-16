@@ -279,7 +279,15 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
     try:
         task = ET.fromstring(xml)
     except ET.ParseError:
-        _unverified()
+        if not isinstance(xml, bytes):
+            _unverified()
+        # schtasks stdout uses the console codec but retains a UTF-16 XML
+        # declaration. Genuine UTF-16 documents already parsed above.
+        from hermes_cli.gateway_windows import _decode_schtasks_output
+        try:
+            task = ET.fromstring(_decode_schtasks_output(xml))
+        except ET.ParseError:
+            _unverified()
     ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
     principals = task.findall("t:Principals/t:Principal", ns)
     actions = task.find("t:Actions", ns)
