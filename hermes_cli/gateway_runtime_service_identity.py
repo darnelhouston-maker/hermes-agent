@@ -279,7 +279,15 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
     try:
         task = ET.fromstring(xml)
     except ET.ParseError:
-        _unverified()
+        if not isinstance(xml, bytes):
+            _unverified()
+        # schtasks stdout uses the console codec but retains a UTF-16 XML
+        # declaration. Genuine UTF-16 documents already parsed above.
+        from hermes_cli.gateway_windows import _decode_schtasks_output
+        try:
+            task = ET.fromstring(_decode_schtasks_output(xml))
+        except ET.ParseError:
+            _unverified()
     ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
     principals = task.findall("t:Principals/t:Principal", ns)
     actions = task.find("t:Actions", ns)
@@ -293,9 +301,9 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
         _unverified()
     if user.casefold() not in {account.casefold(), sid.casefold()}:
         raise ValueError("service_account_mismatch")
-    if principal.findtext("t:RunLevel", "", ns) != "LeastPrivilege" or actions.get("Context") != principal.get("id"):
+    if principal.findtext("t:RunLevel", "LeastPrivilege", ns) != "LeastPrivilege" or actions.get("Context") != principal.get("id"):
         _unverified()
-    if task.findtext("t:Settings/t:Enabled", "", ns) != "true":
+    if task.findtext("t:Settings/t:Enabled", "true", ns) != "true":
         raise ValueError("service_disabled")
     action = actions[0]
     if action.tag != '{' + ns['t'] + '}Exec' or action.findtext('t:Command', '', ns).lower() not in {"wscript.exe", r"c:\windows\system32\wscript.exe"}:
