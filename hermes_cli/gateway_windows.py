@@ -767,6 +767,12 @@ def _spawn_detached(script_path: Path | None = None, home: Path | None = None) -
     process is independent of whichever shell started it.
     """
     _assert_windows()
+    from hermes_cli.gateway_windows_session import request_interactive_gateway
+    interactive_pid = request_interactive_gateway(
+        home if home is not None else _hermes_home(), deadline=time.monotonic() + 45,
+    )
+    if interactive_pid is not None:
+        return interactive_pid
     argv, working_dir, env_overlay = _build_gateway_argv(home)
     from tools.environments.local import served_profile_child_env
     # home=None is this process's own gateway, not a forced jump to the default root.

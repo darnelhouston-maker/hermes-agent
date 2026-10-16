@@ -286,6 +286,8 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
     if len(principals) != 1 or actions is None or len(actions) != 1:
         _unverified()
     principal = principals[0]
+    if principal.findtext("t:LogonType", "", ns) != "InteractiveToken":
+        _unverified()
     user = principal.findtext("t:UserId", "", ns)
     if not user or not account or not sid or principal.find("t:GroupId", ns) is not None:
         _unverified()

@@ -373,6 +373,24 @@ This is unrelated to Windows but sometimes surfaces first there. Usually it mean
 **"Works on my other machine" encoding weirdness after `git pull`.**
 If you edited Hermes config or a skill on Windows using a non-UTF-8 editor (Notepad on older Windows versions, some Chinese IMEs), the file may have been saved with a BOM. Hermes tolerates `utf-8-sig` on most config reads, but a BOM inside a folded YAML scalar (`description: >`) silently breaks YAML parsing. Re-save the file as plain UTF-8 without BOM.
 
+### Desktop automation from SSH or a service
+
+Windows Session 0 has no interactive user desktop. A healthy agent card or an
+MCP handshake does not prove desktop availability. For a local Cua backend,
+gateway starts from that context use the existing, owner-bound `InteractiveToken`
+Scheduled Task; interactive starts retain the hidden-process launch path.
+Missing or mismatched tasks fail with `windows_interactive_service_required`
+instead of silently starting another Session 0 desktop worker. Register the
+gateway once with `hermes gateway install` under its intended user account.
+
+`hermes computer-use doctor --session-ready --json` checks visible window-station
+and input-desktop access, then a non-capture display RPC. A locked or service
+desktop cannot report ready. This does not grant approval or change permission
+modes. Remote terminal/sandbox backends keep their own desktop placement.
+Task submission is not readiness: wait for the gateway's home-scoped control
+identity and the desktop readiness receipt. Do not replay a prior operation
+merely because its transport or desktop failed.
+
 ## Where to go next
 
 - **[Installation](../getting-started/installation.md)** — the full install page, including Linux/macOS/WSL2.

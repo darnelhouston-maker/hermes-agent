@@ -285,6 +285,10 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         if sandbox_mcp_invocation() is not None:
             contract = {"ready": True}
         else:
+            from tools.computer_use.permissions import native_desktop_check
+            desktop = native_desktop_check()
+            if desktop is not None and desktop["status"] == "fail":
+                raise RuntimeError(desktop["message"])
             if not os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip():
                 from pm import ensure
                 ensure("cua-driver")

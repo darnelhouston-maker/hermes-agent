@@ -82,6 +82,20 @@ def _mac_permissions(binary: str, out: dict[str, Any]) -> None:
             if isinstance(data.get("source"), dict):
                 out["source"] = data["source"]
 
+def native_desktop_check() -> Optional[dict[str, Any]]:
+    """The local Windows driver must never inherit a service/locked desktop."""
+    if sys.platform != "win32":
+        return None
+    from hermes_platform import host
+    ready = host.interactive_session()
+    return {
+        "name": "interactive_desktop", "status": "pass" if ready else "fail",
+        "message": "Interactive desktop accessible." if ready else
+        "windows_interactive_session_required: use the owner's interactive gateway, not a Session 0 process.",
+        "data": {"phase": "windows-interactive-desktop"},
+    }
+
+
 def computer_use_status(driver_cmd: Optional[str] = None) -> dict[str, Any]:
     """OS-aware readiness for the desktop card; key order is an API payload contract. ``ready`` is the single signal the
     UI keys off: macOS = both TCC grants, elsewhere = driver health (no TCC model); ``None`` = unknown (binary missing /
@@ -104,6 +118,10 @@ def computer_use_status(driver_cmd: Optional[str] = None) -> dict[str, Any]:
                    ready=provider.is_available())
         return out
     if not binary:
+        return out
+    desktop = native_desktop_check()
+    if desktop is not None and desktop["status"] == "fail":
+        out.update(ready=False, checks=[desktop], error=desktop["message"])
         return out
     with suppress(Exception):
         out["version"] = (_run(binary, "--version", timeout=5).stdout or "").strip() or None

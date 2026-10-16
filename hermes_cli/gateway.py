@@ -1137,6 +1137,13 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         _base_env = {{**os.environ, **_respawn_env_overlay}}
         try:
             if sys.platform == "win32":
+                from pathlib import Path
+                from hermes_cli.gateway_windows_session import requires_interactive_gateway
+                _target_home = Path(_base_env["HERMES_HOME"])
+                if requires_interactive_gateway(_target_home):
+                    from hermes_cli.gateway_windows import _spawn_detached
+                    _spawn_detached(home=_target_home)
+                    raise SystemExit(0)
                 try:
                     _popen_kwargs["creationflags"] = windows_detach_flags()
                     # Stamp the breakaway state exactly like gateway_windows._spawn_detached so the
