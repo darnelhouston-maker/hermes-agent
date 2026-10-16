@@ -2,6 +2,7 @@ name: A2A native contracts
 
 on:
   pull_request:
+    branches: ['release/windows-computer-use-ready-mismatch-20261014']
     paths:
       - '.github/workflows/a2a-native-contracts.yml'
       - 'plugins/platforms/a2a/**'
