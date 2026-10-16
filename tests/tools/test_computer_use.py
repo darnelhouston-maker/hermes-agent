@@ -1455,6 +1455,7 @@ class TestCuaEnvironmentScrubbing:
 
         async def drive_lifecycle():
             test_env = {
+                "HERMES_HOME": os.environ["HERMES_HOME"],
                 "OPENAI_API_KEY": "sk-secret",         # blocked
                 "ANTHROPIC_API_KEY": "sk-ant-secret",  # blocked
                 "PATH": "/usr/bin:/bin",               # safe
@@ -1510,7 +1511,8 @@ class TestCuaEnvironmentScrubbing:
                 try:
                     await session._lifecycle_coro()
                 except BaseException:
-                    pass  # mocks may raise; the env capture still landed
+                    if not captured_env:
+                        raise
                 finally:
                     signal_task.cancel()
                     try:
