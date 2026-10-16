@@ -174,7 +174,7 @@ def run(*, root: Path, timeout: float = 45.0, now: int | None = None) -> dict[st
     now = int(time.time()) if now is None else now
     state_path = root / "state" / "computer_use_readiness_canary.json"
     try:
-        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        previous = json.loads(state_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         previous = {}
 
