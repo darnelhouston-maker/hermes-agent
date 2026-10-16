@@ -127,20 +127,15 @@ def test_session0_remote_or_headless_config_is_unchanged(target_home, boundaries
 @pytest.mark.parametrize("failure", ["config", "start", "readiness", "deadline", "wrong_backend"])
 def test_session0_failures_do_not_report_a_launcher_pid(target_home, boundaries, failure):
     _, discover, start, ready, config = boundaries
-    reason = "windows_interactive_gateway_not_ready"
-    if failure == "config":
-        config.side_effect = OSError("unreadable")
-        reason = "windows_interactive_config_invalid"
-    elif failure == "start":
-        start.side_effect = RuntimeStartError("service_start_failed")
-        reason = "service_start_failed"
-    elif failure == "deadline":
-        ready.side_effect = TimeoutError
-    elif failure == "wrong_backend":
-        discover.return_value = ExistingService("systemd", ("systemctl", "start", "unrelated"))
-        reason = "service_identity_unverified"
-    else:
-        ready.return_value = []
+    mutations = {
+        "config": (config, "side_effect", OSError("unreadable"), "windows_interactive_config_invalid"),
+        "start": (start, "side_effect", RuntimeStartError("service_start_failed"), "service_start_failed"),
+        "deadline": (ready, "side_effect", TimeoutError, ""),
+        "wrong_backend": (discover, "return_value", ExistingService("systemd", ("systemctl", "start", "unrelated")), "service_identity_unverified"),
+        "readiness": (ready, "return_value", [], "windows_interactive_gateway_not_ready"),
+    }
+    boundary, attribute, value, reason = mutations[failure]
+    setattr(boundary, attribute, value)
     expected = TimeoutError if failure == "deadline" else RuntimeStartError
     with pytest.raises(expected, match=None if failure == "deadline" else reason):
         session.request_interactive_gateway(target_home, 10.0)
@@ -148,3 +143,27 @@ def test_session0_failures_do_not_report_a_launcher_pid(target_home, boundaries,
         start.assert_not_called()
     if failure in {"config", "start", "wrong_backend"}:
         ready.assert_not_called()
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("pid", [None, 7476])
+def test_watcher_uses_same_handoff_without_replaying_direct_spawn(target_home, monkeypatch, pid):
+    request, popen = Mock(return_value=pid), Mock()
+    monkeypatch.setattr(session, "request_interactive_gateway", request)
+    monkeypatch.setattr(session.subprocess, "Popen", popen)
+    env = {"HERMES_HOME": str(target_home)}
+    session.spawn_watched_gateway(["python", "gateway"], {}, env)
+    request.assert_called_once()
+    assert request.call_args.args[0] == target_home
+    assert popen.call_count == int(pid is None)
+
+
+@pytest.mark.platforms("windows")
+def test_watcher_never_falls_back_after_task_refusal(target_home, monkeypatch):
+    request = Mock(side_effect=RuntimeStartError("service_identity_unverified"))
+    popen = Mock()
+    monkeypatch.setattr(session, "request_interactive_gateway", request)
+    monkeypatch.setattr(session.subprocess, "Popen", popen)
+    with pytest.raises(RuntimeStartError, match="service_identity_unverified"):
+        session.spawn_watched_gateway(["python", "gateway"], {}, {"HERMES_HOME": str(target_home)})
+    popen.assert_not_called()

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import time
 
 from hermes_cli.config_effective import load_user_config_effective
 from hermes_cli.gateway_runtime_service import (
@@ -56,3 +58,18 @@ def request_interactive_gateway(home: Path, deadline: float) -> int | None:
     if not pids:
         raise RuntimeStartError("windows_interactive_gateway_not_ready")
     return pids[0]
+
+
+def spawn_watched_gateway(command: list[str], options: dict, env: dict[str, str]) -> None:
+    """Preserve watcher argv/env and detach flags, except the Session0 handoff."""
+    from hermes_cli._subprocess_compat import (
+        _WINDOWS_GATEWAY_BREAKAWAY_ENV, windows_detach_flags, windows_detach_flags_without_breakaway,
+    )
+    if request_interactive_gateway(Path(env["HERMES_HOME"]), time.monotonic() + 45) is not None:
+        return
+    try:
+        subprocess.Popen(command, **options, creationflags=windows_detach_flags(),
+                         env={**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"})
+    except OSError:
+        subprocess.Popen(command, **options, creationflags=windows_detach_flags_without_breakaway(),
+                         env={**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"})
