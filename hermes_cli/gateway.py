@@ -1095,8 +1095,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         # ``-c`` only puts the cwd on sys.path, so name the checkout explicitly.
         sys.path.insert(0, {project_root_literal})
         from hermes_cli._subprocess_compat import (
-            _WINDOWS_GATEWAY_BREAKAWAY_ENV, pid_exists_stdlib, windows_detach_flags,
-            windows_detach_flags_without_breakaway,
+            pid_exists_stdlib,
         )
 
         pid = int(sys.argv[1])
@@ -1137,19 +1136,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         _base_env = {{**os.environ, **_respawn_env_overlay}}
         try:
             if sys.platform == "win32":
-                try:
-                    _popen_kwargs["creationflags"] = windows_detach_flags()
-                    # Stamp the breakaway state exactly like gateway_windows._spawn_detached so the
-                    # respawned gateway's exit-diag / lifecycle records show whether it escaped the
-                    # parent Job Object (a job-teardown kill is otherwise indistinguishable).
-                    _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}}
-                    subprocess.Popen(cmd, **_popen_kwargs)
-                except OSError:
-                    # CREATE_BREAKAWAY_FROM_JOB is rejected with ERROR_ACCESS_DENIED when the parent's
-                    # job object refuses breakaway; retry without it (mirrors _spawn_detached).
-                    _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
-                    _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}}
-                    subprocess.Popen(cmd, **_popen_kwargs)
+                helper = "import hermes_bootstrap; import os,sys; from hermes_cli.gateway_windows_session import spawn_watched_gateway; spawn_watched_gateway(sys.argv[1:], {{}}, dict(os.environ))"
+                subprocess.run([cmd[0], "-c", helper, *cmd], **_popen_kwargs,
+                               env=_base_env, timeout=50, check=True)
             else:
                 if _respawn_env_overlay:
                     _popen_kwargs["env"] = _base_env

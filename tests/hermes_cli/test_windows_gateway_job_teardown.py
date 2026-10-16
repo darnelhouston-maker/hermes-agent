@@ -21,6 +21,11 @@ Two fixes under test:
 """
 
 from hermes_cli import gateway
+import subprocess
+import sys
+import time
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # 1. Watcher template contract
@@ -54,6 +59,31 @@ class TestWatcherRespawnTemplate:
         dedented literal — guard against brace/indentation regressions."""
         src = _captured_watcher_source(monkeypatch)
         compile(src, "<watcher>", "exec")
+
+
+@pytest.mark.platforms("windows")
+def test_bare_restart_watcher_uses_target_dependency_environment(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal: {backend: ssh}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    marker = tmp_path / "respawned"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ok')"]
+    captured = {}
+    with monkeypatch.context() as scoped:
+        def capture(argv, **kwargs):
+            captured["argv"] = argv
+            return type("Child", (), {"pid": 12345})()
+        scoped.setattr(gateway.subprocess, "Popen", capture)
+        assert gateway._spawn_gateway_restart_watcher(99999999, command, host=False)
+    argv = captured["argv"]
+    result = subprocess.run([sys._base_executable, "-S", *argv[1:]],
+                            cwd=tmp_path, capture_output=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(.05)
+    assert marker.read_text() == "ok"
 
 # ---------------------------------------------------------------------------
 # 2. Post-update resume liveness gate

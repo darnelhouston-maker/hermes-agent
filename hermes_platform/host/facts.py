@@ -394,19 +394,62 @@ def nvidia_gpus() -> tuple[NvidiaGpu, ...]:
     return _linux_nvidia_gpus() if sys.platform.startswith("linux") else ()
 
 
+def process_session_id(pid: int | None = None) -> int | None:
+    """Windows session of one PID (self by default); None off Windows or on failure.
+
+    Uncached metadata only: a dead/inaccessible PID never borrows our session.
+    """
+    if pid is not None and (type(pid) is not int or not 0 < pid <= 0xFFFFFFFF):
+        return None
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        probe = kernel32.ProcessIdToSessionId
+        probe.argtypes = (wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+        probe.restype = wintypes.BOOL
+        session_id = wintypes.DWORD()
+        if probe(os.getpid() if pid is None else pid, ctypes.byref(session_id)):
+            return session_id.value
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
 def _windows_interactive_session() -> bool:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    process_id = kernel32.GetCurrentProcessId()
-    session_id = wintypes.DWORD()
-    if not kernel32.ProcessIdToSessionId(process_id, ctypes.byref(session_id)) or session_id.value == 0:
+    if process_session_id() in (None, 0):
         return False
-    active_session = kernel32.WTSGetActiveConsoleSessionId()
-    if active_session != 0xFFFFFFFF and active_session == session_id.value:
-        return True
-    return bool(kernel32.GetProcessWindowStation())
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetProcessWindowStation.restype = wintypes.HANDLE
+    user32.GetUserObjectInformationW.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.OpenInputDesktop.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.CloseDesktop.argtypes = (wintypes.HANDLE,)
+
+    class UserObjectFlags(ctypes.Structure):
+        _fields_ = [("inherit", wintypes.BOOL), ("reserved", wintypes.BOOL),
+                    ("flags", wintypes.DWORD)]
+
+    flags, length = UserObjectFlags(), wintypes.DWORD()
+    station = user32.GetProcessWindowStation()
+    if not station or not user32.GetUserObjectInformationW(
+        station, 1, ctypes.byref(flags), ctypes.sizeof(flags), ctypes.byref(length)
+    ) or not flags.flags & 1:  # UOI_FLAGS / WSF_VISIBLE
+        return False
+    desktop = user32.OpenInputDesktop(0, False, 1)  # DESKTOP_READOBJECTS; no capture/input
+    if not desktop:
+        return False
+    user32.CloseDesktop(desktop)
+    return True
 
 
 def interactive_session() -> bool:

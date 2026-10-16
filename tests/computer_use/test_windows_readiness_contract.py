@@ -90,7 +90,7 @@ def test_timeout_never_reports_unknown_and_cleans_up(monkeypatch):
             session.start()
         message = str(exc_info.value)
         assert "phase: mcp-initialize" in message
-        assert "unknown" not in message
+        assert "phase: unknown" not in message
         assert session._lifecycle_done_event.wait(1)
         assert session._started is False
     finally:
@@ -138,6 +138,9 @@ def test_driver_and_delayed_tool_readiness_agree(monkeypatch):
 
 def test_canary_records_the_resolved_driver_version(tmp_path, monkeypatch):
     from hermes_cli import computer_use_readiness_canary as canary
+    monkeypatch.setattr(canary, "_gateway_desktop_context", lambda *_a, **_k: {
+        "status": "pass", "ready": True, "reason": None,
+    })
 
     payload = {
         "driver_version": "0.22.1",

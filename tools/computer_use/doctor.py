@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.permissions import _child_env as _sanitized_cua_env
 from tools.computer_use.permissions import stale_tcc_grant_hint
+from tools.computer_use.permissions import native_desktop_check
 
 # Match the ALLOWED_STATUS_VALUES + ALLOWED_OVERALL_VALUES the cua-driver integration test pins.
 _STATUS_GLYPH = {"pass": "✅", "fail": "❌", "skip": "⏭️"}
@@ -85,6 +86,11 @@ def probe_tool_session_readiness(*, timeout: float = 30.0) -> Report:
     """Open and close the real Hermes MCP session without reading or changing UI."""
     from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
 
+    desktop = native_desktop_check()
+    if desktop is not None and desktop["status"] == "fail":
+        return {"ready": False, "phase": "windows-interactive-desktop", "elapsed_ms": 0,
+                "cleanup": "not-started", "error_class": "RuntimeError", "reason": desktop["message"]}
+
     bridge = _AsyncBridge()
     session = _CuaDriverSession(bridge)
     session._startup_timeout_seconds = timeout
@@ -94,6 +100,12 @@ def probe_tool_session_readiness(*, timeout: float = 30.0) -> Report:
     try:
         session.start()
         started = True
+        if sys.platform == "win32":
+            session._startup_phase = "desktop-probe"
+            result = session.call_tool("get_displays", {}, timeout=timeout)
+            if result.get("isError") is not False:
+                raise RuntimeError("windows_desktop_probe_failed")
+            session._startup_phase = "ready"
     except Exception as exc:
         error = exc
     finally:
@@ -566,6 +578,15 @@ def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (),
     for stream in (sys.stdout, sys.stderr):
         with suppress(AttributeError, OSError):
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    desktop = native_desktop_check()
+    if desktop is not None and desktop["status"] == "fail":
+        report = _apply_hermes_readiness_contract({"overall": "failed", "checks": [desktop]},
+                                                session_ready=session_ready)
+        if json_output:
+            print(json.dumps(report, sort_keys=True))
+        else:
+            print(desktop["message"])
+        return 1
     from tools.computer_use.cua_backend_driver import resolve_cua_driver_cmd
     binary = resolve_cua_driver_cmd(driver_cmd)
     if not binary:

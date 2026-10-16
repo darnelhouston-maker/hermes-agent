@@ -34,6 +34,10 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
     """
     home = profile_home.resolve()
+    if sys.platform == "win32":
+        from hermes_cli.gateway_windows_session import requires_interactive_gateway
+        if requires_interactive_gateway(home):
+            raise RuntimeStartError("windows_interactive_service_required")
     root = Path(__file__).resolve().parent.parent
     # A root home is only pinned by an explicit selector: without one the child's
     # _apply_profile_override follows the sticky active_profile and boots the wrong

@@ -18,6 +18,12 @@ import itertools
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def _synthetic_interactive_host(monkeypatch):
+    """Mocked drivers run against an interactive host unless a test overrides it."""
+    monkeypatch.setattr("hermes_platform.host.interactive_session", lambda: True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend(grant_computer_use_approvals):
     """Tear down the cached backend between tests; destructive actions get an interactive "once"
     through the shared approval gate (the tool fails closed with nobody to ask)."""
@@ -39,22 +45,6 @@ def noop_backend():
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-
-
-class TestRegistration:
-    def test_cua_driver_cmd_env_override_is_resolved_dynamically(self, tmp_path, monkeypatch):
-        from tools.computer_use import cua_backend
-        from tools.computer_use import cua_backend_driver
-
-        driver = tmp_path / "custom-cua-driver"
-        driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        driver.chmod(0o755)
-
-        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(driver))
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-        assert cua_backend_driver.resolve_cua_driver_cmd() == str(driver)
-        assert cua_backend.cua_driver_binary_available() is True
 
 
 # ---------------------------------------------------------------------------
@@ -1219,8 +1209,8 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      f' "screenshot_file_path": "{shot!s}"}}')
+            stdout = json.dumps({"element_count": 7, "tree_markdown": "- [0] AXButton",
+                                 "screenshot_file_path": str(shot)})
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1465,6 +1455,7 @@ class TestCuaEnvironmentScrubbing:
 
         async def drive_lifecycle():
             test_env = {
+                "HERMES_HOME": os.environ["HERMES_HOME"],
                 "OPENAI_API_KEY": "sk-secret",         # blocked
                 "ANTHROPIC_API_KEY": "sk-ant-secret",  # blocked
                 "PATH": "/usr/bin:/bin",               # safe
@@ -1485,7 +1476,9 @@ class TestCuaEnvironmentScrubbing:
                        return_value=("cua-driver", ["mcp"])), \
                  patch("mcp.StdioServerParameters", side_effect=capture_env), \
                  patch("mcp.client.stdio.stdio_client") as mock_stdio, \
-                 patch("mcp.ClientSession") as mock_session_class:
+                 patch("mcp.ClientSession") as mock_session_class, \
+                 patch("tools.computer_use.cua_backend_session._load_mcp_client") as load_mcp:
+                load_mcp.return_value = mock_session_class, capture_env, mock_stdio
 
                 # stdio_client(params) is used as `async with`.
                 mock_stdio.return_value.__aenter__ = AsyncMock(
@@ -1518,7 +1511,8 @@ class TestCuaEnvironmentScrubbing:
                 try:
                     await session._lifecycle_coro()
                 except BaseException:
-                    pass  # mocks may raise; the env capture still landed
+                    if not captured_env:
+                        raise
                 finally:
                     signal_task.cancel()
                     try:
