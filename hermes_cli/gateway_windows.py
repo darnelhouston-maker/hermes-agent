@@ -495,14 +495,8 @@ def _atomic_write(path: Path, content: str, tmp: Path) -> None:
 # ── Install / uninstall
 
 def _resolve_task_user() -> str | None:
-    """Return ``DOMAIN\\USER`` if available, else bare USERNAME, else None."""
-    username = os.environ.get("USERNAME") or os.environ.get("USER") or os.environ.get("LOGNAME")
-    if not username:
-        return None
-    if "\\" in username:
-        return username
-    domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{username}" if domain else username
+    from hermes_cli.gateway_windows_session import current_task_user
+    return current_task_user()
 
 
 def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | None) -> str:
@@ -565,6 +559,9 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
 def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, str]:
     """Create or replace the Scheduled Task. Returns (success, detail). Always delete+create, never
     ``/Change``: it preserves stale repeat/restart settings that relaunch the gateway every minute."""
+    user = _resolve_task_user()
+    if not user:
+        return False, "windows_task_owner_unavailable"
     delete_code, delete_out, delete_err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
     delete_detail = (delete_err or delete_out or "").strip()
     if "cannot find" in delete_detail.lower():
@@ -572,7 +569,6 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
     if delete_code != 0 and delete_detail and _is_access_denied(delete_detail):
         return (False, f"schtasks /Delete failed (code {delete_code}): {delete_detail}")
     # Other /Delete failures are non-fatal: /Create /F may still replace it; keep the detail.
-    user = _resolve_task_user()
     launcher_path = script_path.with_suffix(".vbs")   # the task launches the console-less .vbs
     xml_path = launcher_path.with_suffix(".task.xml")
     xml_path.write_text(_build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline="")
