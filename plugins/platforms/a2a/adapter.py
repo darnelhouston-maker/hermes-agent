@@ -292,6 +292,30 @@ class A2AAdapter(BasePlatformAdapter):
         """
         return True
 
+    @property
+    def token(self) -> str:
+        """Bind native provenance to this connector's credential generation, not its port."""
+        context = self._security_context
+        if not (context.bearer_token or context.peer_tokens):
+            return ""
+        credentials = json.dumps(["hermes-a2a-native-v1", context.bearer_token,
+                                  sorted(context.peer_tokens), context.requested_host,
+                                  context.allow_all_users, sorted(context.trusted_peers)])
+        return hashlib.sha256(credentials.encode()).hexdigest()
+
+    async def reauthorize_native_roles(self, source) -> bool:
+        """Recheck the authenticated peer under the owning profile before admission/recovery."""
+        current = security.A2ASecurityContext.capture()
+        if (current != self._security_context or source.platform != self.platform
+                or source.chat_type != "dm" or not source.chat_id
+                or not isinstance(source.user_id, str) or not source.user_id
+                or source.user_name != source.user_id):
+            return False
+        peer = source.user_id
+        named = any(name == peer for _, name in current.peer_tokens)
+        socket_peer = peer.startswith("ip:") and (current.bearer_token or current.localhost_only())
+        return bool((named or socket_peer) and current.is_trusted_peer(peer))
+
     async def connect(self, **_kwargs) -> bool:
         # Capture the gateway loop so the HTTP thread can marshal events via run_coroutine_threadsafe.
         self._loop = asyncio.get_running_loop()
@@ -574,6 +598,8 @@ class A2AAdapter(BasePlatformAdapter):
         fut = self._add_pending(task_id, context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        # Only the token-authenticated HTTP path supplies peer; serialized input never supplies trust.
+        event.source.role_authorized = True
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
