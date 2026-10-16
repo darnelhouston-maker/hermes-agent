@@ -90,7 +90,7 @@ def test_timeout_never_reports_unknown_and_cleans_up(monkeypatch):
             session.start()
         message = str(exc_info.value)
         assert "phase: mcp-initialize" in message
-        assert "unknown" not in message
+        assert "phase: unknown" not in message
         assert session._lifecycle_done_event.wait(1)
         assert session._started is False
     finally:

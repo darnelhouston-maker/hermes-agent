@@ -174,6 +174,7 @@ def test_spawn_detached_marks_primary_breakaway_success(monkeypatch, tmp_path, c
     argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
     cwd = str(tmp_path)
     calls = []
+    monkeypatch.setattr("hermes_cli.gateway_windows_session.request_interactive_gateway", lambda *_a, **_k: None)
 
     def fake_popen(call_argv, **kwargs):
         calls.append((call_argv, kwargs))
@@ -208,6 +209,7 @@ def test_spawn_detached_warns_and_marks_no_breakaway_fallback(
     argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
     cwd = str(tmp_path)
     calls = []
+    monkeypatch.setattr("hermes_cli.gateway_windows_session.request_interactive_gateway", lambda *_a, **_k: None)
 
     def fake_popen(call_argv, **kwargs):
         calls.append((call_argv, kwargs))

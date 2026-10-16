@@ -1095,8 +1095,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         # ``-c`` only puts the cwd on sys.path, so name the checkout explicitly.
         sys.path.insert(0, {project_root_literal})
         from hermes_cli._subprocess_compat import (
-            _WINDOWS_GATEWAY_BREAKAWAY_ENV, pid_exists_stdlib, windows_detach_flags,
-            windows_detach_flags_without_breakaway,
+            pid_exists_stdlib,
         )
 
         pid = int(sys.argv[1])
@@ -1137,8 +1136,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         _base_env = {{**os.environ, **_respawn_env_overlay}}
         try:
             if sys.platform == "win32":
-                from hermes_cli.gateway_windows_session import spawn_watched_gateway
-                spawn_watched_gateway(cmd, _popen_kwargs, _base_env)
+                helper = "import hermes_bootstrap; import os,sys; from hermes_cli.gateway_windows_session import spawn_watched_gateway; spawn_watched_gateway(sys.argv[1:], {{}}, dict(os.environ))"
+                subprocess.run([cmd[0], "-c", helper, *cmd], **_popen_kwargs,
+                               env=_base_env, timeout=50, check=True)
             else:
                 if _respawn_env_overlay:
                     _popen_kwargs["env"] = _base_env

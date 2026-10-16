@@ -14,6 +14,7 @@ def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypat
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime_start as start
     from hermes_cli import gateway_windows
+    monkeypatch.setattr("hermes_cli.gateway_windows_session.requires_interactive_gateway", lambda _home: False)
 
     flags = ('HERMES_SAFE_MODE', 'HERMES_IGNORE_USER_CONFIG')
     for key in flags:
@@ -308,6 +309,7 @@ def test_native_windows_spawn_never_retries_without_breakaway(tmp_path, monkeypa
     from hermes_cli import gateway_runtime_start as start
     from hermes_cli.gateway_runtime_service import RuntimeStartError
     from hermes_cli._subprocess_compat import windows_detach_flags
+    monkeypatch.setattr("hermes_cli.gateway_windows_session.requires_interactive_gateway", lambda _home: False)
     calls = []
     def denied(argv, **kwargs):
         calls.append(kwargs)

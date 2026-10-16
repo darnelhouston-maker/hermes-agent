@@ -33,3 +33,39 @@ def test_interactive_session_requires_visible_accessible_desktop(
         user.OpenInputDesktop.assert_not_called()
     elif visible and desktop:
         user.CloseDesktop.assert_called_once_with(128)
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("pid,session,success,expected", [
+    (None, 1, True, 1), (7476, 0, True, 0), (22000, 1, True, 1),
+    (7476, 1, False, None),
+])
+def test_process_session_id_queries_only_requested_pid(monkeypatch, pid, session, success, expected):
+    import ctypes
+    from hermes_platform import host
+
+    kernel = Mock()
+    def query(actual_pid, target):
+        assert actual_pid == (99 if pid is None else pid)
+        target._obj.value = session
+        return int(success)
+    kernel.ProcessIdToSessionId.side_effect = query
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel)
+    monkeypatch.setattr("os.getpid", lambda: 99)
+    assert host.process_session_id(pid) == expected
+
+
+@pytest.mark.platforms("windows")
+def test_process_session_id_api_unavailable_is_unknown(monkeypatch):
+    import ctypes
+    from hermes_platform import host
+
+    monkeypatch.setattr(ctypes, "WinDLL", Mock(side_effect=OSError("unavailable")))
+    assert host.process_session_id(7476) is None
+
+
+@pytest.mark.parametrize("pid", [0, -1, True, "7476", 1.5, 0x100000000])
+def test_process_session_id_rejects_invalid_pid_without_query(pid):
+    from hermes_platform import host
+
+    assert host.process_session_id(pid) is None

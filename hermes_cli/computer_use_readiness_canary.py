@@ -38,6 +38,51 @@ def _profiles(root: Path) -> list[tuple[str, Path]]:
     return found
 
 
+def _gateway_desktop_context(home: Path, *, timeout: float) -> dict[str, Any]:
+    """Check only the exact home's live owner metadata, never desktop contents."""
+    context = {"status": "not-applicable", "ready": None, "reason": None,
+               "gateway_pid": None, "gateway_session_id": None, "canary_session_id": None}
+    if sys.platform != "win32":
+        return context
+    from hermes_cli.gateway_windows_session import _requires_local_desktop
+
+    try:
+        target = home.resolve()
+        if not _requires_local_desktop(target):
+            context["reason"] = "remote_or_headless_backend"
+            return context
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {**context, "status": "fail", "ready": False, "reason": "gateway_config_unavailable"}
+    from gateway.control_socket import identify_gateway
+    from hermes_platform import host
+
+    context.update(status="fail", ready=False)
+    try:
+        identity = identify_gateway(target, timeout=timeout)
+        if identity is None:
+            return {**context, "status": "not-checked", "reason": "gateway_owner_unavailable"}
+        if not isinstance(identity, dict):
+            return {**context, "reason": "gateway_identity_invalid"}
+        owner_home, pid = identity.get("hermes_home"), identity.get("pid")
+        if (not isinstance(owner_home, str) or not Path(owner_home).is_absolute()
+                or Path(owner_home).resolve() != target):
+            return {**context, "reason": "gateway_home_mismatch"}
+        if type(pid) is not int or not 0 < pid <= 0xFFFFFFFF:
+            return {**context, "reason": "gateway_pid_invalid"}
+        context.update(gateway_pid=pid, canary_session_id=host.process_session_id(),
+                       gateway_session_id=host.process_session_id(pid))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {**context, "reason": "gateway_session_query_unavailable"}
+    current, owner = context["canary_session_id"], context["gateway_session_id"]
+    if current is None or owner is None:
+        return {**context, "reason": "gateway_session_query_unavailable"}
+    if current == 0 or owner == 0:
+        return {**context, "reason": "gateway_noninteractive_session"}
+    if current != owner:
+        return {**context, "reason": "gateway_session_mismatch"}
+    return {**context, "status": "pass", "ready": True}
+
+
 def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
     env = dict(os.environ)
     env["HERMES_HOME"] = str(home)
@@ -80,16 +125,19 @@ def _probe(profile: str, home: Path, *, timeout: float) -> dict[str, Any]:
             and readiness.get("ready") is True
             and readiness.get("cleanup") == "complete"
         )
+        gateway_context = _gateway_desktop_context(home, timeout=min(timeout, 2.0))
+        gateway_failed = gateway_context["ready"] is False
         return {
             "profile": profile,
-            "ok": ok,
+            "ok": ok and not gateway_failed,
+            "gateway_context": gateway_context,
             "driver_overall": payload.get("hermes_driver_overall"),
             "driver_version": driver_version,
-            "phase": readiness.get("phase") or "not-reported",
+            "phase": "gateway-desktop-context" if gateway_failed else readiness.get("phase") or "not-reported",
             "elapsed_ms": readiness.get("elapsed_ms") or round((time.monotonic() - began) * 1000),
             "cleanup": readiness.get("cleanup") or "not-reported",
-            "error_class": readiness.get("error_class"),
-            "reason": readiness.get("reason"),
+            "error_class": "GatewayDesktopContextUnavailable" if gateway_failed else readiness.get("error_class"),
+            "reason": gateway_context["reason"] if gateway_failed else readiness.get("reason"),
         }
     except subprocess.TimeoutExpired:
         return {

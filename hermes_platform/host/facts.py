@@ -394,14 +394,36 @@ def nvidia_gpus() -> tuple[NvidiaGpu, ...]:
     return _linux_nvidia_gpus() if sys.platform.startswith("linux") else ()
 
 
+def process_session_id(pid: int | None = None) -> int | None:
+    """Windows session of one PID (self by default); None off Windows or on failure.
+
+    Uncached metadata only: a dead/inaccessible PID never borrows our session.
+    """
+    if pid is not None and (type(pid) is not int or not 0 < pid <= 0xFFFFFFFF):
+        return None
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        probe = kernel32.ProcessIdToSessionId
+        probe.argtypes = (wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+        probe.restype = wintypes.BOOL
+        session_id = wintypes.DWORD()
+        if probe(os.getpid() if pid is None else pid, ctypes.byref(session_id)):
+            return session_id.value
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
 def _windows_interactive_session() -> bool:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    process_id = kernel32.GetCurrentProcessId()
-    session_id = wintypes.DWORD()
-    if not kernel32.ProcessIdToSessionId(process_id, ctypes.byref(session_id)) or session_id.value == 0:
+    if process_session_id() in (None, 0):
         return False
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.GetProcessWindowStation.restype = wintypes.HANDLE
