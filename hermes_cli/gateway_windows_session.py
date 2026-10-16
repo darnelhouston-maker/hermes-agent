@@ -15,6 +15,25 @@ from hermes_cli.gateway_runtime_service import (
 from hermes_platform import host
 
 
+def current_task_user() -> str | None:
+    """Read the process token's SAM account, never SSH's USERDOMAIN overlay."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        query = ctypes.WinDLL("secur32", use_last_error=True).GetUserNameExW
+        query.argtypes = (ctypes.c_int, wintypes.LPWSTR, ctypes.POINTER(wintypes.ULONG))
+        query.restype = wintypes.BOOL
+        buffer, size = ctypes.create_unicode_buffer(32768), wintypes.ULONG(32768)
+        if query(2, buffer, ctypes.byref(size)):  # NameSamCompatible
+            account = buffer.value
+            if account.count("\\") == 1 and all(account.split("\\")) and not any(c in account for c in "\r\n\x00"):
+                return account
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _requires_local_desktop(home: Path) -> bool:
     try:
         config = load_user_config_effective(home / "config.yaml", fail_closed=True)
