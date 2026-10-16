@@ -28,6 +28,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_interactive_host(monkeypatch):
+    """Mocked drivers run against an interactive host unless a test overrides it."""
+    monkeypatch.setattr("hermes_platform.host.interactive_session", lambda: True)
+
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 

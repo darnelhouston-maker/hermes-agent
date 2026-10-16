@@ -8,6 +8,12 @@ import pytest
 from tests.computer_use.driver_fixture import record_driver
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_interactive_host(monkeypatch):
+    """Mocked drivers run against an interactive host unless a test overrides it."""
+    monkeypatch.setattr("hermes_platform.host.interactive_session", lambda: True)
+
+
 @pytest.fixture
 def cua_home(tmp_path, monkeypatch):
     from pm import paths

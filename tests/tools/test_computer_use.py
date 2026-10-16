@@ -18,6 +18,12 @@ import itertools
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def _synthetic_interactive_host(monkeypatch):
+    """Mocked drivers run against an interactive host unless a test overrides it."""
+    monkeypatch.setattr("hermes_platform.host.interactive_session", lambda: True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend(grant_computer_use_approvals):
     """Tear down the cached backend between tests; destructive actions get an interactive "once"
     through the shared approval gate (the tool fails closed with nobody to ask)."""
