@@ -1,5 +1,6 @@
 """Authenticated A2A peers must survive the durable native admission boundary."""
 import asyncio
+from copy import copy
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.session_envelope import prepare_native
 from gateway.session_ingress_context import native_callback, register_transport_home
+from gateway.session_ingress_context import reauthorize_roles, restore_provenance
 from gateway.session_authority import initialize_session_authority
 from gateway.run import GatewayRunner
 from hermes_state_runtime import RuntimeStoreError
@@ -101,9 +103,41 @@ async def test_real_native_admission_accepts_peer_but_not_forged_or_revoked(conn
     with native_callback(runner, event, home):
         payload = await prepare_native(runner, event)
     assert payload['native_text_v1']['reauthorize'] == 'roles'
+    # Recreate the connector as on restart: unchanged policy retains its binding.
+    replacement = A2AAdapter(PlatformConfig(enabled=True))
+    runner.adapters[connector.platform] = replacement
+    provenance = payload['native_text_v1']['provenance']
+    restored = copy(event.source)
+    restore_provenance(runner, restored, provenance)
+    assert await reauthorize_roles(runner, restored, provenance) is True
+    runner.adapters[connector.platform] = connector
     with pytest.raises(RuntimeStoreError, match='invalid_params'):
         await prepare_native(runner, event)  # A serialized role flag cannot mint callback provenance.
     monkeypatch.setenv('A2A_TRUSTED_PEERS', 'other-peer')
     with native_callback(runner, event, home):
         with pytest.raises(RuntimeStoreError, match='permission_denied'):
             await prepare_native(runner, event)
+    replacement = A2AAdapter(PlatformConfig(enabled=True))
+    runner.adapters[connector.platform] = replacement
+    with pytest.raises(RuntimeStoreError, match='profile_mismatch'):
+        restore_provenance(runner, event.source, provenance)
+
+
+@pytest.mark.anyio
+async def test_reauthorization_never_borrows_other_profile_credentials(connector, tmp_path):
+    import agent.secret_scope as scopes
+    import hermes_constants
+    home = tmp_path / 'other-profile'
+    home.mkdir()
+    (home / '.env').write_text('A2A_PEER_TOKENS=other-peer:other-fixture\n'
+                              'A2A_TRUSTED_PEERS=other-peer\nA2A_HOST=0.0.0.0\n')
+    prior = scopes._MULTIPLEX_ACTIVE
+    scopes.set_multiplex_active(True)
+    home_token = hermes_constants.set_hermes_home_override(str(home))
+    token = scopes.set_secret_scope(scopes.build_profile_secret_scope(home), profile_home=str(home))
+    try:
+        assert await connector.reauthorize_native_roles(source(connector)) is False
+    finally:
+        scopes.reset_secret_scope(token)
+        hermes_constants.reset_hermes_home_override(home_token)
+        scopes.set_multiplex_active(prior)
