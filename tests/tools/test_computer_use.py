@@ -52,7 +52,7 @@ class TestRegistration:
         from tools.computer_use import cua_backend
         from tools.computer_use import cua_backend_driver
 
-        driver = tmp_path / "custom-cua-driver"
+        driver = tmp_path / ("custom-cua-driver.exe" if os.name == "nt" else "custom-cua-driver")
         driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         driver.chmod(0o755)
 
@@ -1225,8 +1225,8 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      f' "screenshot_file_path": "{shot!s}"}}')
+            stdout = json.dumps({"element_count": 7, "tree_markdown": "- [0] AXButton",
+                                 "screenshot_file_path": str(shot)})
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1491,7 +1491,9 @@ class TestCuaEnvironmentScrubbing:
                        return_value=("cua-driver", ["mcp"])), \
                  patch("mcp.StdioServerParameters", side_effect=capture_env), \
                  patch("mcp.client.stdio.stdio_client") as mock_stdio, \
-                 patch("mcp.ClientSession") as mock_session_class:
+                 patch("mcp.ClientSession") as mock_session_class, \
+                 patch("tools.computer_use.cua_backend_session._load_mcp_client") as load_mcp:
+                load_mcp.return_value = mock_session_class, capture_env, mock_stdio
 
                 # stdio_client(params) is used as `async with`.
                 mock_stdio.return_value.__aenter__ = AsyncMock(

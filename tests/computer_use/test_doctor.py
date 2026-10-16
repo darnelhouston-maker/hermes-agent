@@ -20,6 +20,7 @@ shape.
 from __future__ import annotations
 
 import json
+import os
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -264,6 +265,8 @@ class TestJsonOutput:
 class TestDriverCmdResolution:
     @staticmethod
     def _executable(path: Path) -> Path:
+        if os.name == "nt":
+            path = path.with_suffix(".exe")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
