@@ -1,0 +1,54 @@
+name: A2A native contracts
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/a2a-native-contracts.yml'
+      - 'plugins/platforms/a2a/**'
+      - 'gateway/session*.py'
+      - 'gateway/authz_mixin.py'
+      - 'gateway/run_adapters.py'
+      - 'tests/plugins/test_a2a*.py'
+      - 'hermes_cli/computer_use_readiness_canary.py'
+      - 'tests/hermes_cli/test_readiness_canary_state.py'
+  push:
+    branches: ['release/windows-computer-use-ready-mismatch-20261014']
+    paths:
+      - 'plugins/platforms/a2a/**'
+      - 'gateway/session*.py'
+      - 'gateway/authz_mixin.py'
+      - 'gateway/run_adapters.py'
+      - '.github/workflows/a2a-native-contracts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2a-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+      - name: Native ingress, A2A policy and no-replay contracts
+        run: |
+          bash scripts/run_tests.sh -j 2 \
+            tests/plugins/test_a2a_native_authorization.py \
+            tests/plugins/test_a2a_plugin.py \
+            tests/plugins/test_a2a_phase23.py \
+            tests/plugins/test_a2a_rejected_resend.py \
+            tests/plugins/test_a2a_forwarded_cancel_retry.py \
+            tests/plugins/test_a2a_tools_gate.py \
+            tests/gateway/test_native_ingress_trust.py \
+            tests/gateway/test_session_a2a.py \
+            tests/hermes_cli/test_readiness_canary_state.py
