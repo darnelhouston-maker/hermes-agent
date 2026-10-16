@@ -137,10 +137,11 @@ def test_loaded_launchd_identity_is_independent_of_disk(configured, command, rea
 
 
 @pytest.mark.parametrize("case,reason", [
-    ("bound", None), ("utf16", None), ("wrong_home", "profile_mismatch"),
+    ("bound", None), ("utf16", None), ("native_defaults", None), ("wrong_home", "profile_mismatch"),
     ("wrong_user", "service_account_mismatch"), ("missing_user", "service_identity_unverified"),
     ("extra_action", "service_identity_unverified"), ("disabled", "service_disabled"),
     ("noninteractive", "service_identity_unverified"),
+    ("elevated", "service_identity_unverified"),
     ("unknown_script", "service_identity_unverified"), ("malformed_xml", "service_identity_unverified"),
 ])
 def test_task_xml_binds_actual_action_and_principal(case, reason, tmp_path):
@@ -169,6 +170,10 @@ def test_task_xml_binds_actual_action_and_principal(case, reason, tmp_path):
         xml = xml.replace(user, 'DOMAIN\\other')
     if case == 'noninteractive':
         xml = xml.replace('InteractiveToken', 'S4U')
+    if case == 'native_defaults':
+        xml = xml.replace('<RunLevel>LeastPrivilege</RunLevel>', '').replace('<Enabled>true</Enabled>', '')
+    if case == 'elevated':
+        xml = xml.replace('LeastPrivilege', 'HighestAvailable')
     if case == 'missing_user':
         xml = xml.replace(f'<UserId>{user}</UserId>', '')
     if case == 'extra_action':
