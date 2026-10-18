@@ -327,8 +327,15 @@ def _send_task_uncontrolled(
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
 
     reply, reply_ctx, state, task_id = _task_fields(resp.get("result", {}), ctx)
-    if reply_ctx != ctx and not task_id:
+    if reply_ctx != ctx:
         raise ValueError(f"Peer '{agent_label}' returned a mismatched conversation context.")
+    if task_id:
+        from .task_archive import TaskArchive
+        endpoint = hashlib.sha256(json.dumps([base_url, tenant]).encode()).hexdigest()
+        try:
+            TaskArchive().bind_alias(agent_label, endpoint, rpc_body["id"], task_id, reply_ctx)
+        except Exception as exc:
+            logger.warning("A2A receipt alias persistence failed (%s); retain returned canonical receipt, do not resend", type(exc).__name__)
     while task_id and state not in _CALL_TERMINAL_STATES:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -547,6 +554,14 @@ def a2a_task_status(args: dict, **_: Any) -> str:
         tenant = _interface_tenant(card, peer)
         tenant_params = {"tenant": tenant} if tenant else {}
         if task_id:
+            from .task_archive import lookup_alias
+            endpoint = hashlib.sha256(json.dumps([base_url, tenant]).encode()).hexdigest()
+            binding = lookup_alias(agent, endpoint, task_id)
+            if binding:
+                task_id, bound_context = binding
+                if context_id and context_id != bound_context:
+                    return "Error: task receipt context mismatch; do not resend."
+                context_id = bound_context
             payload = _task_rpc(base_url, card, headers, "GetTask", {"id": task_id, **tenant_params}, timeout)
         else:
             listing = _task_rpc(
@@ -559,8 +574,13 @@ def a2a_task_status(args: dict, **_: Any) -> str:
                 return f"No task found for context '{context_id}'."
             payload = tasks[0]
         reply, reply_ctx, state, resolved_task_id = _task_fields(payload, context_id)
+        if (task_id and resolved_task_id != task_id) or (context_id and reply_ctx != context_id):
+            return "Error: peer task receipt identity mismatch; do not resend."
         return _format_task_result(agent, reply, reply_ctx, state, resolved_task_id or task_id)
     except urllib.error.HTTPError as exc:
+        if exc.code == 429 and not args.get("_retried_429"):
+            time.sleep(1.0)
+            return a2a_task_status({**args, "_retried_429": True})
         return f"Error: task status from '{agent}' failed — HTTP {exc.code}."
     except Exception as exc:
         return f"Error: task status from '{agent}' failed — {exc}."

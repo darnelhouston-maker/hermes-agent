@@ -245,6 +245,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             ) is not None:
                 payload["served_agents"] = self.adapter._served_agent_summary(
                     public_url=self._request_public_url() or None)
+                payload["task_receipts"] = self.adapter.tasks.health()
             self._json(200, payload)
             return
         if subpath == "/metrics":
@@ -373,7 +374,8 @@ class A2AAdapter(BasePlatformAdapter):
 
         # Per-adapter protocol state (not module-global): task store, anti-loop
         # turn tracking, and rate limiting.
-        self.tasks = protocol.TaskStore()
+        from .task_archive import TaskArchive
+        self.tasks = TaskArchive()
         self._turns = protocol.TurnTracker()
         self._rate_limiter = protocol.RateLimiter()
         self._content_guard = RecentInboundGuard(content_dedupe_window())
@@ -770,6 +772,10 @@ class A2AAdapter(BasePlatformAdapter):
         task_id = protocol.new_task_id()
 
         scope = self._scope_for_agent(agent)
+        message = params.get("message") if isinstance(params.get("message"), dict) else {}
+        request_id = str(message.get("messageId") or "").strip()
+        if prior := self.tasks.prior_request(context_id, peer, scope, request_id, text):
+            return protocol.TaskStore.to_task(prior), None
         if text and (volume_count := self._volume_alarm.observe(peer, scope)):
             logger.error("A2A: sender-to-peer volume alarm for peer %s (%d turns)", peer, volume_count)
             start_volume_alarm(peer, scope, volume_count)
@@ -778,8 +784,6 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: active shared work item suppressed for peer %s", peer)
             return self._duplicate_task(prior_task_id, context_id, peer, scope)
-        message = params.get("message") if isinstance(params.get("message"), dict) else {}
-        request_id = str(message.get("messageId") or "").strip()
         if request_id:
             prior_task_id = self._request_guard.claim(peer, scope, request_id, task_id)
             if prior_task_id:
@@ -791,6 +795,10 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: duplicate content suppressed for peer %s", peer)
             return self._duplicate_task(prior_task_id, context_id, peer, scope)
+
+        rec, fresh = self.tasks.accept(task_id, context_id, peer, *scope, request_id=request_id, text=text)
+        if not fresh:
+            return protocol.TaskStore.to_task(rec), None
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -1215,7 +1223,12 @@ class A2AAdapter(BasePlatformAdapter):
             history_len = int(history_len) if history_len is not None else None
         except (TypeError, ValueError):
             history_len = None
-        return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec, history_length=history_len))
+        task = protocol.TaskStore.to_task(rec, history_length=history_len)
+        if params.get("metadataOnly") is True:
+            task.pop("artifacts", None)
+            task.pop("history", None)
+            task["status"].pop("message", None)
+        return protocol.jsonrpc_result(req_id, task)
 
     def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
         try:
