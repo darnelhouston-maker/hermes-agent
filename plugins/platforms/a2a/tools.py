@@ -159,6 +159,10 @@ def _task_fields(payload: Any, fallback_context: str) -> tuple[str, str, str, st
     payload = protocol.unwrap_send_message_response(payload)
     if not isinstance(payload, dict):
         return str(payload), fallback_context, "", ""
+    if payload.get("id") and not isinstance(payload.get("contextId"), str):
+        raise ValueError("Peer task receipt has no explicit context identity; do not resend.")
+    if payload.get("id") and not payload.get("contextId", "").strip():
+        raise ValueError("Peer task receipt has no explicit context identity; do not resend.")
     context_id = str(payload.get("contextId") or fallback_context).strip() or fallback_context
     state = str((payload.get("status") or {}).get("state") or "")
     task_id = str(payload.get("id") or "").strip()

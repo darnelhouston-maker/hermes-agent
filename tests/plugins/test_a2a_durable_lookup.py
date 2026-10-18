@@ -124,3 +124,53 @@ def test_live_lookup_rate_limit_hotfix_is_preserved_without_submission(monkeypat
     monkeypatch.setattr(tools, "_task_rpc", rpc)
     assert "synthetic-result" in tools.a2a_task_status({"agent": "watson", "task_id": "task"})
     assert calls == [1.0]
+
+
+def test_failed_acceptance_does_not_poison_next_attempt(monkeypatch):
+    instance = adapter()
+    original = instance.tasks.accept
+    monkeypatch.setattr(instance.tasks, "accept", MagicMock(side_effect=sqlite3.OperationalError("synthetic full disk")))
+    text = "Shared work item: synthetic-only\n\nfabricated"
+    params = {"message": p.text_message(p.ROLE_USER, text, context_id="ctx", message_id="m")}
+    agent = {"local": False, "slug": "", "tenant": ""}
+    forward = MagicMock(return_value=("synthetic-completed", p.STATE_COMPLETED))
+    monkeypatch.setattr(instance, "_forward_to_profile", forward)
+    with pytest.raises(sqlite3.OperationalError):
+        instance._prepare_task(params, "peer", agent)
+    assert instance._request_guard._entries == {}
+    assert instance._content_guard._entries == {}
+    assert instance._active_work_items == {}
+    monkeypatch.setattr(instance.tasks, "accept", original)
+    receipt, pending = instance._prepare_task(params, "peer", agent)
+    assert pending is None and receipt["status"]["state"] == p.STATE_COMPLETED
+    again, _ = instance._prepare_task(params, "peer", agent)
+    assert again["id"] == receipt["id"]
+    forward.assert_called_once()
+
+
+@pytest.mark.parametrize("entrypoint", ["send", "poll", "status"])
+@pytest.mark.parametrize("missing_context", [None, "", False])
+def test_missing_explicit_context_never_binds_or_returns_completion(monkeypatch, entrypoint, missing_context):
+    monkeypatch.setattr(tools, "_fetch_card", lambda *_args: None)
+    monkeypatch.setattr(tools.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _agent: {"url": "http://localhost:9999", "timeout": 5})
+    calls = []
+    def post(_url, body, *_args):
+        calls.append(body["method"])
+        if entrypoint == "poll" and body["method"] == "SendMessage":
+            task = p.build_task("task", "ctx", p.STATE_WORKING)
+        else:
+            task = p.build_task("task", "ctx", p.STATE_COMPLETED, "MUST-NOT-RETURN")
+            task["contextId"] = missing_context
+        return p.jsonrpc_result(body["id"], task)
+    monkeypatch.setattr(tools, "_http_post_json", post)
+    if entrypoint == "status":
+        output = tools.a2a_task_status({"agent": "watson", "task_id": "task", "context_id": "ctx"})
+        assert "explicit context identity" in output and "MUST-NOT-RETURN" not in output
+        assert calls == ["GetTask"]
+    else:
+        with pytest.raises(ValueError, match="explicit context identity"):
+            tools._send_task_uncontrolled("watson", {"url": "http://localhost:9999", "timeout": 5}, "fabricated", "ctx")
+        assert calls.count("SendMessage") == 1
+        if entrypoint == "send":
+            assert not archive_path().exists()

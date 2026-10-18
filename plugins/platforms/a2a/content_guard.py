@@ -53,6 +53,13 @@ class RecentInboundGuard:
     def claim(self, peer: str, scope: tuple[str, str], text: str, task_id: str) -> str:
         if self.window <= 0:
             return ""
+
+    def release_unaccepted(self, peer: str, scope: tuple[str, str], text: str, task_id: str) -> None:
+        """Release only this attempt's process-local reservation after failed acceptance."""
+        key = self.key(peer, scope, text)
+        with self._lock:
+            if self._entries.get(key, (None, None))[1] == task_id:
+                self._entries.pop(key, None)
         now = self.time_fn()
         key = self.key(peer, scope, text)
         with self._lock:
