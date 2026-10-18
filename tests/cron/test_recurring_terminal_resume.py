@@ -137,6 +137,24 @@ def test_old_error_does_not_make_future_resume_immediately_due(store):
     assert "resume_previous_run_at" not in jobs.get_job(old["id"])
 
 
+def test_scoped_store_identity_uses_store_profile_not_ambient_home(store, tmp_path):
+    old = completed(script=True)
+    replacement = jobs.create_job("synthetic", "every 6h", script="synthetic.py", no_agent=True)
+    records = jobs.load_jobs()
+    profile = tmp_path / "other-profile"
+    (profile / "scripts").mkdir(parents=True)
+    (profile / "scripts/synthetic.py").write_text("raise RuntimeError('MUST NOT EXECUTE')\n")
+    for record in records:
+        if record["id"] == replacement["id"]:
+            record["script"] = str(profile / "scripts/synthetic.py")
+    with jobs.use_cron_store(profile / "cron"):
+        jobs.save_jobs(records)
+        before = (profile / "cron/jobs.json").read_bytes()
+        with pytest.raises(ValueError, match="equivalent active"):
+            jobs.resume_job(old["id"], remaining_runs=1)
+        assert (profile / "cron/jobs.json").read_bytes() == before
+
+
 def test_paused_jobs_and_one_shot_rearm_restrictions_survive(store):
     paused = jobs.create_job("synthetic", "every 1h")
     jobs.pause_job(paused["id"], reason="intentional hold")
