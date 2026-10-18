@@ -171,3 +171,35 @@ def test_bound_acceptance_terminal_inventory_and_reads_are_noop(store):
     assert report["request_bindings"] == 1 and report["result_reads"] == 0
     assert "SYNTHETIC" not in str(report)
     assert store.path.read_bytes() == before
+
+
+def test_default_owner_token_changes_after_fork(tmp_path):
+    first = TaskArchive(tmp_path / "receipts" / "tasks.sqlite3")
+    first.create("t", "ctx", "peer")
+    if not hasattr(os, "fork"):
+        pytest.skip("fork is Unix-only; subprocess restart has separate coverage")
+    pid = os.fork()
+    if pid == 0:
+        try:
+            assert first.complete("t", p.STATE_FAILED, "fabricated") is None
+            other = TaskArchive(first.path)
+            ok = other.get("t").get("owner_reconciliation_required") and other.owner != first.owner
+            os._exit(0 if ok else 1)
+        except BaseException:
+            os._exit(2)
+    assert os.waitpid(pid, 0)[1] == 0
+
+
+def test_task_id_cannot_bind_a_second_unrelated_message(store):
+    store.accept("task", "ctx", "peer", request_id="m-one", text="first")
+    store.complete("task", p.STATE_COMPLETED, "first-result")
+    with pytest.raises(ValueError, match="exact message binding"):
+        store.accept("task", "ctx", "peer", request_id="m-two", text="second")
+    assert store.prior_request("ctx", "peer", ("", ""), "m-two", "second") is None
+    assert store.get("task")["reply"] == "first-result"
+
+
+def test_legacy_task_record_cannot_be_promoted_to_new_message_authority(store):
+    store.create("legacy", "ctx", "peer")
+    with pytest.raises(ValueError, match="exact message binding"):
+        store.accept("legacy", "ctx", "peer", request_id="new-message", text="fabricated")

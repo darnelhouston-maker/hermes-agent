@@ -16,7 +16,7 @@ import uuid
 
 from . import protocol
 
-_OWNER = f"{os.getpid()}-{uuid.uuid4().hex}"
+_GENERATION = uuid.uuid4().hex
 _INTERRUPTED = "Accepted task owner unavailable; outcome unknown. Do not resend. Original-owner reconciliation required."
 
 
@@ -28,10 +28,11 @@ def archive_path() -> Path:
 class TaskArchive(protocol.TaskStore):
     """SQLite-authoritative TaskStore; in-memory Futures never own retained proof."""
 
-    def __init__(self, path: Path | None = None, *, owner: str = _OWNER):
+    def __init__(self, path: Path | None = None, *, owner: str | None = None):
         super().__init__()
         self.path = path or archive_path()
-        self.owner = owner
+        self.owner = owner or f"{os.getpid()}-{_GENERATION}"
+        self._pid = os.getpid()
         self._lock = threading.RLock()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink():
@@ -51,6 +52,9 @@ class TaskArchive(protocol.TaskStore):
 
     @contextmanager
     def _transaction(self):
+        if self._pid != os.getpid():
+            self.owner = f"{os.getpid()}-{_GENERATION}"
+            self._pid = os.getpid()
         with self._lock, sqlite3.connect(self.path, timeout=10) as db:
             db.execute("PRAGMA synchronous=FULL")
             db.execute("PRAGMA foreign_keys=ON")
@@ -87,10 +91,14 @@ class TaskArchive(protocol.TaskStore):
             if prior:
                 if (prior["context_id"], prior["peer"], prior["agent_slug"], prior["tenant"]) != (context_id, peer, agent_slug, tenant):
                     raise ValueError("A2A task identity conflict")
+                if request_id and (prior.get("request_key"), prior.get("request_fingerprint")) != (key, fingerprint):
+                    raise ValueError("A2A task identity conflicts with exact message binding")
                 return self._view(prior), False
             rec = dict(task_id=task_id, context_id=context_id, peer=peer, agent_slug=agent_slug,
                        tenant=tenant, state=protocol.STATE_SUBMITTED, reply="", created_at=time.time(),
                        created_iso=protocol.now_iso(), push_url="", push_config_id="", owner=self.owner)
+            if request_id:
+                rec.update(request_key=key, request_fingerprint=fingerprint)
             self._save(db, rec)
             if request_id:
                 db.execute("INSERT INTO requests VALUES (?, ?, ?)", (key, fingerprint, task_id))
@@ -167,7 +175,7 @@ class TaskArchive(protocol.TaskStore):
         with self._transaction() as db:
             total = db.execute("SELECT count(*) FROM tasks" + where, args).fetchone()[0]
             page = [self._view(json.loads(row[0])) for row in db.execute(
-                "SELECT record FROM tasks" + where + " ORDER BY rowid DESC LIMIT ? OFFSET ?", (*args, size, max(0, offset)))]
+                "SELECT record FROM tasks" + where + " ORDER BY json_extract(record, '$.created_at') DESC, id DESC LIMIT ? OFFSET ?", (*args, size, max(0, offset)))]
         next_offset = offset + size if offset + size < total else 0
         return (page, next_offset, total) if with_total else (page, next_offset)
 
@@ -232,6 +240,14 @@ def receipt_inventory(path: Path, task_ids=()):
                 "alias_bindings": db.execute("SELECT count(*) FROM aliases").fetchone()[0],
                 "requested_ids_present": sum(bool(db.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone()) for tid in task_ids),
                 "mutations": 0, "result_reads": 0, "submissions": 0}
+
+
+def lookup_alias(peer, endpoint, alias, *, path: Path | None = None):
+    path = path or archive_path()
+    if not path.is_file():
+        return None
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT task, context FROM aliases WHERE peer=? AND endpoint=? AND alias=?", (peer, endpoint, alias)).fetchone()
 
 
 if __name__ == "__main__":
