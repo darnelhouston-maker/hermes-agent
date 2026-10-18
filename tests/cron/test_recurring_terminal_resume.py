@@ -38,7 +38,7 @@ def completed(*, schedule="every 6h", script=False):
 @pytest.mark.parametrize("schedule", ["every 6h", "0 */6 * * *"])
 def test_extended_total_budget_plain_resume_preserves_completed_and_history(store, schedule):
     old = completed(schedule=schedule)
-    jobs.update_job(old["id"], {"repeat": 4})
+    jobs.update_job(old["id"], {"repeat": {"times": 4, "completed": 2}})
     new = jobs.resume_job(old["id"])
     assert new["repeat"] == {"times": 4, "completed": 2}
     assert new["last_run_at"] == old["last_run_at"]
@@ -164,7 +164,7 @@ def test_paused_jobs_and_one_shot_rearm_restrictions_survive(store):
     future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
     with pytest.raises(ValueError, match="one-shot-only"):
         jobs.rearm_oneshot(paused["id"], future)
-    once = jobs.create_job("synthetic", "in 1h")
+    once = jobs.create_job("synthetic", future)
     jobs.mark_job_run(once["id"], success=True)
     with pytest.raises(ValueError, match="terminal"):
         jobs.resume_job(once["id"])

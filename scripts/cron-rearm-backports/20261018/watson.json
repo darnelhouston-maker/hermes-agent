@@ -1,0 +1,37 @@
+{
+  "behavior_source": "6252ebf0cf6490ea3afb29c7cf6419a75efdb416",
+  "family": "watson",
+  "files": {
+    "cron/exhaustion.py": {
+      "after": "93151f4212f61c03ec95280135ed83c2da5d8c598669f790c1efd9e1da7c0a47",
+      "before": null,
+      "changed": true
+    },
+    "cron/jobs.py": {
+      "after": "d3d751c78a3ed29aa09825987c68cb61ba22ea4232de4a6b5a507f52769fed5b",
+      "before": "c8d0d6323f98f5cfcffb2d8d825cc35ca7f3e951c53de1f4fc54cfc1bcd40d8c",
+      "changed": true
+    },
+    "hermes_cli/cron.py": {
+      "after": "02bb49f4625d9b9d5b6a48a16b7f56c4e5e503600161cfcc19e518254e373fef",
+      "before": "6f5f5835c74850cb819caa49928ee3ae3946eddb766d6af54665329d429b915e",
+      "changed": true
+    },
+    "hermes_cli/main.py": {
+      "after": "648fdd918ae0f86d768561442a993193278692c1fe12d56eab63e276a6d732bf",
+      "before": "648fdd918ae0f86d768561442a993193278692c1fe12d56eab63e276a6d732bf",
+      "changed": false
+    },
+    "hermes_cli/subcommands/cron.py": {
+      "after": "8b65976652170d5020f0d2947f7039ecf6ca00a94ba3cd99069aeb87f9c411fc",
+      "before": "c1b3017bb9ea5129df023310859a64fb7ca3967150ac6ac4a2b7b80374c014ec",
+      "changed": true
+    }
+  },
+  "gateway_activation": "separate_quiet_maintenance_gate",
+  "item": "CRON-REARM-TERMINAL-INTERVAL-20261017",
+  "live_job_mutations": 0,
+  "patch_sha256": "fedd8514ed6d41cb86a88dd05ffd71c510b29f49446feb1becdc6d716572312e",
+  "schema": 1,
+  "shared_dependency": "cron/exhaustion.py"
+}
