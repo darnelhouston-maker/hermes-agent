@@ -106,6 +106,37 @@ def test_concurrent_resume_cannot_replenish_budget_twice(store):
     assert jobs.get_job(old["id"])["repeat"] == {"times": 5, "completed": 2}
 
 
+@pytest.mark.parametrize("alias", ["./synthetic.py", "sub/../synthetic.py", "absolute", "symlink.py"])
+def test_path_aliases_cannot_bypass_active_replacement_or_inventory(store, alias):
+    old = completed(script=True)
+    (store / "scripts/sub").mkdir()
+    (store / "scripts/symlink.py").symlink_to(store / "scripts/synthetic.py")
+    replacement = jobs.create_job("synthetic", "every 6h", script="synthetic.py", no_agent=True)
+    records = jobs.load_jobs()
+    for record in records:
+        if record["id"] == replacement["id"]:
+            record["script"] = str(store / "scripts/synthetic.py") if alias == "absolute" else alias
+    jobs.save_jobs(records)
+    before = jobs.JOBS_FILE.read_bytes()
+    with pytest.raises(ValueError, match="equivalent active"):
+        jobs.resume_job(old["id"], remaining_runs=1)
+    assert read_inventory(jobs.JOBS_FILE)["rows"][0]["active_equivalents"] == 1
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
+def test_old_error_does_not_make_future_resume_immediately_due(store):
+    old = completed()
+    old["last_status"] = "error"
+    old["last_run_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    jobs.save_jobs([old])
+    resumed = jobs.resume_job(old["id"], remaining_runs=1)
+    assert resumed["last_status"] == "error" and resumed["last_run_at"] == old["last_run_at"]
+    assert jobs.get_due_jobs() == []
+    assert jobs.get_job(old["id"])["next_run_at"] == resumed["next_run_at"]
+    jobs.mark_job_run(old["id"], success=False)
+    assert "resume_previous_run_at" not in jobs.get_job(old["id"])
+
+
 def test_paused_jobs_and_one_shot_rearm_restrictions_survive(store):
     paused = jobs.create_job("synthetic", "every 1h")
     jobs.pause_job(paused["id"], reason="intentional hold")

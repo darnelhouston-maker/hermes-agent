@@ -7,7 +7,21 @@ from collections import Counter
 from pathlib import Path
 
 
-def project(jobs):
+def source_identity(job, field, scripts_dir=None):
+    value = job.get(field)
+    if not value:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("invalid script/monitor identity")
+    if field == "monitor_url":
+        return value.strip()
+    path = Path(value).expanduser()
+    if scripts_dir is not None and not path.is_absolute():
+        path = Path(scripts_dir) / path
+    return str(path.resolve()) if scripts_dir is not None else str(path)
+
+
+def project(jobs, scripts_dir=None):
     if not isinstance(jobs, list) or any(not isinstance(j, dict) for j in jobs):
         raise ValueError("invalid job inventory")
     rows = []
@@ -24,7 +38,8 @@ def project(jobs):
         active_equivalent = sum(
             other.get("id") != job.get("id") and other.get("enabled", True)
             and other.get("state") not in {"completed", "paused"}
-            and any(job.get(f) and job.get(f) == other.get(f)
+            and any(source_identity(job, f, scripts_dir)
+                    and source_identity(job, f, scripts_dir) == source_identity(other, f, scripts_dir)
                     for f in ("script", "monitor_script", "monitor_url"))
             for other in jobs
         )
@@ -51,7 +66,7 @@ def read_inventory(path):
         return project([])
     raw = path.read_bytes()
     data = json.loads(raw)
-    result = project(data.get("jobs") if isinstance(data, dict) else data)
+    result = project(data.get("jobs") if isinstance(data, dict) else data, path.parent.parent / "scripts")
     result["source_sha256"] = hashlib.sha256(raw).hexdigest()
     return result
 
