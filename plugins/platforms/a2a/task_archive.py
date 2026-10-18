@@ -71,7 +71,7 @@ class TaskArchive(protocol.TaskStore):
         db.execute("INSERT OR REPLACE INTO tasks VALUES (?, ?)", (rec["task_id"], json.dumps(rec)))
 
     def _view(self, rec):
-        if rec and rec["state"] not in protocol.TERMINAL_STATES and rec.get("owner") != self.owner:
+        if rec and rec["state"] not in protocol.TERMINAL_STATES | {protocol.STATE_INPUT_REQUIRED} and rec.get("owner") != self.owner:
             rec = {**rec, "state": protocol.STATE_INPUT_REQUIRED, "reply": _INTERRUPTED,
                    "owner_reconciliation_required": True}
         return rec
