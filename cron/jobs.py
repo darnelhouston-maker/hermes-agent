@@ -986,6 +986,8 @@ def _job_is_stale_error_recurring(
     """
     if job.get("last_status") != "error":
         return False
+    if job.get("resume_previous_run_at", _MISSING) == job.get("last_run_at"):
+        return False  # an explicit future resume must not replay the previous failed occurrence
     from cron.quota_hold import hold_active
     if hold_active(job, now):
         return False  # deliberately parked past a provider usage window, not wedged (#89376)
@@ -2191,10 +2193,13 @@ def resume_job(job_id: str, *, remaining_runs: Optional[int] = None) -> Optional
             if _claim_is_live(current.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
                 raise ValueError("Cannot resume recurring job over a live fire claim.")
             # A replacement watcher must not turn into two active writers on resume.
+            from cron.exhaustion import source_identity
+            scripts_dir = get_hermes_home() / "scripts"
             for field in ("script", "monitor_script", "monitor_url"):
-                source = current.get(field)
+                source = source_identity(current, field, scripts_dir)
                 if source and any(
-                    other.get("id") != current["id"] and other.get(field) == source
+                    other.get("id") != current["id"]
+                    and source_identity(other, field, scripts_dir) == source
                     and other.get("enabled", True) and other.get("state") not in {"paused", "completed"}
                     for other in jobs
                 ):
@@ -2217,6 +2222,7 @@ def resume_job(job_id: str, *, remaining_runs: Optional[int] = None) -> Optional
             current.update(repeat=repeat, run_claim=None, fire_claim=None)
             _activate_job_record(current)
             current["next_run_at"] = next_run
+            current["resume_previous_run_at"] = current.get("last_run_at")
             current.pop("pending_slot", None)
             current.pop("manual_run_at", None)
             current.pop("manual_run_prompt", None)
@@ -2423,6 +2429,7 @@ def _record_run_outcome(
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
+    job.pop("resume_previous_run_at", None)
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)

@@ -738,7 +738,8 @@ def cron_doctor() -> int:
     jobs = list_jobs(include_disabled=False)
     findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
     from cron.exhaustion import project
-    exhausted = project(list_jobs(include_disabled=True))["monitoring_candidates"]
+    from hermes_constants import get_hermes_home
+    exhausted = project(list_jobs(include_disabled=True), get_hermes_home() / "scripts")["monitoring_candidates"]
     if exhausted:
         print(color(f"recurring_repeat_exhausted: {exhausted} terminal monitoring candidate(s); "
                     "inspect with hermes cron exhausted. No jobs revived.", Colors.YELLOW))
