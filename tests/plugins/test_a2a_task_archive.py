@@ -176,6 +176,7 @@ def test_bound_acceptance_terminal_inventory_and_reads_are_noop(store):
 def test_default_owner_token_changes_after_fork(tmp_path):
     first = TaskArchive(tmp_path / "receipts" / "tasks.sqlite3")
     first.create("t", "ctx", "peer")
+    original_owner = first.owner
     if not hasattr(os, "fork"):
         pytest.skip("fork is Unix-only; subprocess restart has separate coverage")
     pid = os.fork()
@@ -183,7 +184,7 @@ def test_default_owner_token_changes_after_fork(tmp_path):
         try:
             assert first.complete("t", p.STATE_FAILED, "fabricated") is None
             other = TaskArchive(first.path)
-            ok = other.get("t").get("owner_reconciliation_required") and other.owner != first.owner
+            ok = other.get("t").get("owner_reconciliation_required") and other.owner != original_owner
             os._exit(0 if ok else 1)
         except BaseException:
             os._exit(2)
