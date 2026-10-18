@@ -204,3 +204,10 @@ def test_legacy_task_record_cannot_be_promoted_to_new_message_authority(store):
     store.create("legacy", "ctx", "peer")
     with pytest.raises(ValueError, match="exact message binding"):
         store.accept("legacy", "ctx", "peer", request_id="new-message", text="fabricated")
+
+
+def test_authentic_input_required_result_is_not_replaced_by_restart_warning(store):
+    store.create("task", "ctx", "peer")
+    store.complete("task", p.STATE_INPUT_REQUIRED, "synthetic clarification")
+    restarted = TaskArchive(store.path, owner="after-restart")
+    assert restarted.get("task")["reply"] == "synthetic clarification"
