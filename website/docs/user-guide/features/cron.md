@@ -1177,6 +1177,26 @@ cronjob(
 )
 ```
 
+Finite recurring jobs retain a completed record when their repeat budget is exhausted.
+`repeat` is a lifetime total, not a remaining count. To schedule future occurrences
+without resetting run history:
+
+```sh
+hermes cron edit <job> --repeat 40  # total, including completed runs
+hermes cron resume <job>          # requires unused budget
+# Or request an explicit number of additional runs:
+hermes cron resume <job> --remaining-runs 20
+hermes cron exhausted             # payload-free, read-only terminal inventory
+```
+
+Recurring resume starts at the next future occurrence; it does not replay missed work.
+It refuses live claims and an equivalent active scripted/monitor replacement.
+`--run-now` and `--at` re-arm one-shots only, and cannot be combined with
+`--remaining-runs`. Exhaustion records `repeat_exhaustion` metadata durably even
+when the last run was successful and silent. `cron doctor` reports terminal
+monitoring candidates, but neither diagnostic revives a job or decides whether
+its business task remains open. Paused jobs remain paused until explicitly resumed.
+
 ## Managing jobs programmatically
 
 The agent-facing API is one tool:
