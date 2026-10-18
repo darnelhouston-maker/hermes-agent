@@ -147,7 +147,7 @@ def test_scoped_store_identity_uses_store_profile_not_ambient_home(store, tmp_pa
     for record in records:
         if record["id"] == replacement["id"]:
             record["script"] = str(profile / "scripts/synthetic.py")
-    with jobs.use_cron_store(profile / "cron"):
+    with jobs.use_cron_store(profile):
         jobs.save_jobs(records)
         before = (profile / "cron/jobs.json").read_bytes()
         with pytest.raises(ValueError, match="equivalent active"):
