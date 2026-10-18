@@ -710,24 +710,41 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
 
 def cron_resume(args) -> int:
     """Resume a paused job or explicitly re-arm a completed one-shot."""
-    if bool(getattr(args, "run_at", None)) == bool(getattr(args, "run_now", False)):
-        if getattr(args, "run_at", None) or getattr(args, "run_now", False):
-            print(color("Use exactly one of --at or --run-now.", Colors.RED))
+    run_at = getattr(args, "run_at", None)
+    run_now = getattr(args, "run_now", False)
+    remaining = getattr(args, "remaining_runs", None)
+    if remaining is not None:
+        if run_at or run_now:
+            print(color("--remaining-runs cannot be combined with --at or --run-now.", Colors.RED))
             return 1
+        from cron.jobs import AmbiguousJobReference, resume_job
+        try:
+            job = resume_job(args.job_id, remaining_runs=remaining)
+        except (AmbiguousJobReference, ValueError) as exc:
+            print(color(f"Failed to resume job: {exc}", Colors.RED))
+            return 1
+        if not job:
+            print(color(f"Job not found: {args.job_id}", Colors.RED))
+            return 1
+        print(color(f"Resumed job: {args.job_id}; remaining runs: {remaining}", Colors.GREEN))
+        print(f"  Next run: {job.get('next_run_at')}")
+        return 0
+    if run_at and run_now:
+        print(color("Use exactly one of --at or --run-now.", Colors.RED))
+        return 1
+    if not run_at and not run_now:
         return _job_action("resume", args.job_id, "Resumed")
     from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot
-
-    run_at = _hermes_now().isoformat() if args.run_now else args.run_at
     try:
-        job = rearm_oneshot(args.job_id, run_at)
+        job = rearm_oneshot(args.job_id, _hermes_now().isoformat() if run_now else run_at)
     except (AmbiguousJobReference, ValueError) as exc:
         print(color(f"Failed to re-arm job: {exc}", Colors.RED))
         return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
-    print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN))
-    print(f"  Next run: {job.get('next_run_at')}")
+    print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN)
+          + f"\n  Next run: {job.get('next_run_at')}")
     return 0
 
 
@@ -794,6 +811,21 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_exhausted() -> int:
+    from cron.exhaustion import main
+    from cron.jobs import _current_cron_store
+    return main(["--jobs-file", str(_current_cron_store().jobs_file)])
+
+
+def cron_doctor() -> int:
+    from cron.exhaustion import main
+    from cron.jobs import _current_cron_store
+    result = main(["--jobs-file", str(_current_cron_store().jobs_file), "--check"])
+    if result == 1:
+        print("recurring_repeat_exhausted: owner review required; no jobs revived.")
+    return result
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -802,6 +834,12 @@ def cron_command(args):
         show_all = getattr(args, 'all', False)
         cron_list(show_all)
         return 0
+
+    if subcmd == "exhausted":
+        return cron_exhausted()
+
+    if subcmd == "doctor":
+        return cron_doctor()
 
     if subcmd == "status":
         cron_status()
