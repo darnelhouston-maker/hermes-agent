@@ -986,6 +986,8 @@ def _job_is_stale_error_recurring(
     """
     if job.get("last_status") != "error":
         return False
+    if job.get("resume_previous_run_at", _MISSING) == job.get("last_run_at"):
+        return False  # an explicit future resume must not replay the previous failed occurrence
     from cron.quota_hold import hold_active
     if hold_active(job, now):
         return False  # deliberately parked past a provider usage window, not wedged (#89376)
@@ -2008,7 +2010,8 @@ def _reject_terminal_activation(job: dict[str, Any], updated: dict[str, Any], jo
     ):
         raise ValueError(
             f"Cannot activate terminal cron job '{job.get('name', job_id)}' "
-            "through update_job; use cron resume --run-now or --at.")
+            "through update_job; use cron resume (recurring) or "
+            "cron resume --run-now/--at (one-shot).")
 
 
 def _apply_pin_update(job: dict[str, Any], updates: dict[str, Any]) -> None:
@@ -2163,7 +2166,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
     })
 
 
-def resume_job(job_id: str) -> Optional[dict[str, Any]]:
+def resume_job(job_id: str, *, remaining_runs: Optional[int] = None) -> Optional[dict[str, Any]]:
     """Resume a paused job. Accepts a job ID or name.
 
     A recurring job paused across one of its slots must not lose that slot silently: the stored
@@ -2175,6 +2178,61 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    if remaining_runs is not None and (
+        isinstance(remaining_runs, bool) or not isinstance(remaining_runs, int)
+        or remaining_runs <= 0
+    ):
+        raise ValueError("remaining_runs must be a positive integer.")
+    if job.get("state") == "completed" and job["schedule"].get("kind") in {"cron", "interval"}:
+        def apply(jobs, _i, current):
+            if current.get("state") != "completed":
+                raise ValueError("Cannot resume: terminal job changed; inspect it again.")
+            now = _hermes_now()
+            if _claim_is_live(current.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
+                raise ValueError("Cannot resume recurring job over a live run claim.")
+            if _claim_is_live(current.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
+                raise ValueError("Cannot resume recurring job over a live fire claim.")
+            # A replacement watcher must not turn into two active writers on resume.
+            from cron.exhaustion import source_identity
+            scripts_dir = _current_cron_store().cron_dir.parent / "scripts"
+            for field in ("script", "monitor_script", "monitor_url"):
+                source = source_identity(current, field, scripts_dir)
+                if source and any(
+                    other.get("id") != current["id"]
+                    and source_identity(other, field, scripts_dir) == source
+                    and other.get("enabled", True) and other.get("state") not in {"paused", "completed"}
+                    for other in jobs
+                ):
+                    raise ValueError("Cannot resume: an equivalent active scripted/monitor job exists.")
+            repeat = dict(current.get("repeat") or {})
+            completed = repeat.get("completed", 0)
+            times = repeat.get("times")
+            if remaining_runs is not None:
+                times = completed + remaining_runs
+                repeat["times"] = times
+            if times is not None and completed >= times:
+                raise ValueError(
+                    "Recurring repeat budget exhausted; use cron resume <job> --remaining-runs <N> "
+                    "or cron edit <job> --repeat <total greater than completed>, then plain resume."
+                )
+            next_run = compute_next_run(current["schedule"])
+            if next_run is None:
+                raise ValueError("Cannot resume: recurring schedule has no next occurrence.")
+            # Keep lifetime counters/history and start at a future slot, never replay old slots.
+            current.update(repeat=repeat, run_claim=None, fire_claim=None)
+            _activate_job_record(current)
+            current["next_run_at"] = next_run
+            current["resume_previous_run_at"] = current.get("last_run_at")
+            current.pop("pending_slot", None)
+            current.pop("manual_run_at", None)
+            current.pop("manual_run_prompt", None)
+            if isinstance(current.get("repeat_exhaustion"), dict):
+                current["repeat_exhaustion"]["resumed_at"] = now.isoformat()
+            save_jobs(jobs)
+            return _normalize_job_record(current)
+        return _with_job(job["id"], apply)
+    if remaining_runs is not None:
+        raise ValueError("--remaining-runs applies only to completed recurring jobs, not paused jobs or one-shots.")
     stored_next = job.get("next_run_at")
     stored_dt = _parse_aware(stored_next) if stored_next else None
     if (
@@ -2211,6 +2269,11 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dic
         return None
     if is_terminal_job(job):
         name = job.get("name", job_id)
+        if job["schedule"].get("kind") in {"cron", "interval"}:
+            raise ValueError(
+                f"Cannot run: job '{name}' is terminal; use cron resume <job> "
+                "--remaining-runs <N> or edit its total repeat budget then plain resume."
+            )
         raise ValueError(
             f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
             f"Create a new occurrence with 'hermes cron resume {name} "
@@ -2243,7 +2306,8 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
 
 
 _REARM_RECURRING_ERROR = (
-    "Cannot re-arm recurring jobs: re-arm is one-shot-only; use plain resume or cron run."
+    "Cannot re-arm recurring jobs with --run-now/--at: re-arm is one-shot-only; "
+    "use plain resume with available repeat budget or --remaining-runs <N>."
 )
 
 
@@ -2365,6 +2429,7 @@ def _record_run_outcome(
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
+    job.pop("resume_previous_run_at", None)
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
@@ -2425,6 +2490,13 @@ def _advance_after_run(job: dict[str, Any], now: str, *, ladder_rung: bool = Fal
             # Limit reached: retain a terminal record instead of popping it, so the status just
             # written stays inspectable in `cronjob list`; the retention sweep prunes it later.
             _complete_job_record(job)
+            if kind in {"cron", "interval"}:
+                job["repeat_exhaustion"] = {
+                    "code": "recurring_repeat_exhausted", "at": now,
+                    "completed": completed, "times": times, "kind": kind,
+                }
+                logger.warning("recurring_repeat_exhausted kind=%s completed=%d times=%d",
+                               kind, completed, times)
             return
 
     job["next_run_at"] = compute_next_run(job["schedule"], now)

@@ -737,7 +737,13 @@ def cron_doctor() -> int:
     from cron.jobs import list_jobs
     jobs = list_jobs(include_disabled=False)
     findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
-    if not findings:
+    from cron.exhaustion import project
+    from cron.jobs import _current_cron_store
+    exhausted = project(list_jobs(include_disabled=True), _current_cron_store().cron_dir.parent / "scripts")["monitoring_candidates"]
+    if exhausted:
+        print(color(f"recurring_repeat_exhausted: {exhausted} terminal monitoring candidate(s); "
+                    "inspect with hermes cron exhausted. No jobs revived.", Colors.YELLOW))
+    if not findings and not exhausted:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
         print(color(note, Colors.DIM))
@@ -752,6 +758,12 @@ def cron_doctor() -> int:
     print()
     print(color("Review the findings above, then run `hermes cron doctor` again.", Colors.DIM))
     return 1
+
+
+def cron_exhausted() -> int:
+    from cron.exhaustion import main
+    from cron.jobs import _current_cron_store
+    return main(["--jobs-file", str(_current_cron_store().jobs_file)])
 
 
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
@@ -902,6 +914,23 @@ def cron_resume(args) -> int:
     """Resume a paused job or explicitly re-arm a completed one-shot."""
     run_at = getattr(args, "run_at", None)
     run_now = getattr(args, "run_now", False)
+    remaining = getattr(args, "remaining_runs", None)
+    if remaining is not None:
+        if run_at or run_now:
+            print(color("--remaining-runs cannot be combined with --at or --run-now.", Colors.RED))
+            return 1
+        from cron.jobs import AmbiguousJobReference, resume_job
+        try:
+            job = resume_job(args.job_id, remaining_runs=remaining)
+        except (AmbiguousJobReference, ValueError) as exc:
+            print(color(f"Failed to resume job: {exc}", Colors.RED))
+            return 1
+        if not job:
+            print(color(f"Job not found: {args.job_id}", Colors.RED))
+            return 1
+        print(color(f"Resumed job: {args.job_id}; remaining runs: {remaining}", Colors.GREEN))
+        print(f"  Next run: {job.get('next_run_at')}")
+        return 0
     if run_at and run_now:
         print(color("Use exactly one of --at or --run-now.", Colors.RED))
         return 1
@@ -972,6 +1001,7 @@ _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
+    "exhausted": lambda a: cron_exhausted(),
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),

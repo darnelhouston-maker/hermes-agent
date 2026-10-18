@@ -156,10 +156,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
 
-    cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
+    cron_subparsers.add_parser("exhausted", help="Read-only, payload-free terminal recurring inventory")
+    cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused or completed recurring job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
     cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
     _flag(cron_resume, "--run-now", help="Re-arm to run now")
+    cron_resume.add_argument(
+        "--remaining-runs", type=int,
+        help="Resume a completed recurring job for N additional runs; preserve completed count.")
 
     cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
     cron_run.add_argument("job_id", help="Job ID to trigger")
