@@ -2737,7 +2737,7 @@ def resume_job(job_id: str, *, remaining_runs: Optional[int] = None) -> Optional
                 raise ValueError("Cannot resume recurring job over a live fire claim.")
             # A replacement watcher must not turn into two active writers on resume.
             from cron.exhaustion import source_identity
-            scripts_dir = get_hermes_home() / "scripts"
+            scripts_dir = _current_cron_store().cron_dir.parent / "scripts"
             for field in ("script", "monitor_script", "monitor_url"):
                 source = source_identity(current, field, scripts_dir)
                 if source and any(
