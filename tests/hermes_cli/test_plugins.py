@@ -1135,6 +1135,159 @@ class TestForceReloadSymmetry:
         assert elapsed < 1.0
         hold.set()
 
+    def test_concurrent_same_tool_calls_with_distinct_ids_both_run(self, monkeypatch):
+        """Two concurrent calls of one tool are different work, not a duplicate (#98382)."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def recorder(**_kwargs):
+            starts.append(1)
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [recorder]
+
+        results = {}
+
+        def fire(name, call_id):
+            results[name] = mgr.invoke_hook(
+                "pre_tool_call",
+                tool_name="terminal",
+                args={"command": "echo ok"},
+                session_id="s1",
+                tool_call_id=call_id,
+            )
+
+        first = threading.Thread(target=fire, args=("first", "call-a"), daemon=True)
+        first.start()
+        time.sleep(0.1)
+        second = threading.Thread(target=fire, args=("second", "call-b"), daemon=True)
+        second.start()
+        time.sleep(0.2)
+        hold.set()
+        first.join(5.0)
+        second.join(5.0)
+
+        assert len(starts) == 2
+        assert results["first"] == []
+        assert results["second"] == []
+
+    def test_repeated_same_call_identity_still_deduplicated(self, monkeypatch):
+        """The same call identity stays a duplicate while its worker is still running."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def blocker(**_kwargs):
+            starts.append(1)
+            hold.wait(timeout=10.0)
+            return "late"
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker]
+
+        def fire():
+            mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id="same-call")
+
+        first = threading.Thread(target=fire, daemon=True)
+        first.start()
+        time.sleep(0.1)
+        second = threading.Thread(target=fire, daemon=True)
+        second.start()
+        second.join(5.0)
+
+        assert len(starts) == 1
+        hold.set()
+        first.join(5.0)
+
+    def test_hung_worker_blocks_new_call_identity_after_suppression(self, monkeypatch):
+        """A worker abandoned on timeout still occupies its callback across new call IDs."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def blocker(**_kwargs):
+            starts.append(1)
+            hold.wait(timeout=10.0)
+            return "late"
+
+        mgr = PluginManager()
+        mgr._hook_timeout_suppression_seconds = 0.0
+        mgr._hooks["post_tool_call"] = [blocker]
+
+        assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id="call-a") == []
+        assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id="call-b") == []
+
+        assert len(starts) == 1
+        hold.set()
+
+    def test_nested_handle_function_call_without_tool_call_id_concurrent_pre_tool_call(self, monkeypatch):
+        """Concurrent nested execute_code -> hermes_tools.<tool> calls without explicit tool_call_id
+        allocate distinct correlation IDs and do not fail closed with a false pre_tool_call timeout."""
+        import time
+        from model_tools import handle_function_call
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        seen_ids = []
+
+        def slow_policy(**kwargs):
+            seen_ids.append(kwargs.get("tool_call_id"))
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._discovered = True
+        mgr._hooks["pre_tool_call"] = [slow_policy]
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = json.dumps({"output": "ok", "exit_code": 0})
+
+        results = {}
+
+        def invoke_nested(label, task_id):
+            results[label] = handle_function_call(
+                "terminal",
+                {"command": "echo ok"},
+                task_id=task_id,
+            )
+
+        with patch("model_tools.registry", mock_registry):
+            t1 = threading.Thread(target=invoke_nested, args=("c1", "task-1"), daemon=True)
+            t2 = threading.Thread(target=invoke_nested, args=("c2", "task-2"), daemon=True)
+            t1.start()
+            time.sleep(0.05)
+            t2.start()
+            time.sleep(0.15)
+            hold.set()
+            t1.join(5.0)
+            t2.join(5.0)
+
+        assert len(seen_ids) == 2
+        assert seen_ids[0] and seen_ids[1] and seen_ids[0] != seen_ids[1]
+        assert json.loads(results["c1"]) == {"output": "ok", "exit_code": 0}
+        assert json.loads(results["c2"]) == {"output": "ok", "exit_code": 0}
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow."""
         import time
@@ -1155,6 +1308,7 @@ class TestForceReloadSymmetry:
             return None
 
         mgr = PluginManager()
+        mgr._discovered = True
         mgr._hooks["pre_tool_call"] = [hung_policy]
 
         import hermes_cli.plugins as plugins_mod
@@ -1190,6 +1344,7 @@ class TestForceReloadSymmetry:
             return None
 
         mgr = PluginManager()
+        mgr._discovered = True
         mgr._hooks["pre_tool_call"] = [hung_policy]
 
         import hermes_cli.plugins as plugins_mod

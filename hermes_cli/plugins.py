@@ -3589,6 +3589,21 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
+def _hook_call_identity(kwargs: Dict[str, Any]) -> Optional[str]:
+    """Identity of the call this callback fires for, or ``None`` when the event has none.
+
+    Concurrent invocations of the same tool or hook across sessions/threads must not
+    collapse into one gate key: they are different work, and treating the second as a
+    duplicate drops the hook as if a callback had timed out (upstream #98382,
+    TOOL-HOOK-TIMEOUT-20261120).
+    """
+    for field in ("tool_call_id", "turn_id", "api_request_id", "session_id", "task_id"):
+        value = kwargs.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _pre_tool_call_timeout_block() -> Dict[str, str]:
     """Fail-closed directive when a policy callback times out or is still running."""
     return {
@@ -3657,6 +3672,7 @@ class PluginManager:
         # (hook_name, id(cb)) so a stuck policy hook cannot spawn a new
         # abandoned daemon thread on every subsequent fire.
         self._hook_running_callbacks: Dict[tuple, object] = {}
+        self._hook_abandoned: Dict[tuple, set] = {}
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
@@ -4041,6 +4057,7 @@ class PluginManager:
             self._context_engine = None
             with self._hook_timeout_lock:
                 self._hook_running_callbacks.clear()
+                self._hook_abandoned.clear()
                 self._hook_timeout_suppressed_until.clear()
             self._discovered = False
         else:
@@ -5465,16 +5482,20 @@ class PluginManager:
 
         for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
-            callback_key = (hook_name, id(cb))
+            suppression_key = (hook_name, id(cb))
+            gate_key = (*suppression_key, _hook_call_identity(kwargs))
             try:
                 if use_timeout:
                     token = object()
                     now = time.monotonic()
                     with self._hook_timeout_lock:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
-                            callback_key
+                            suppression_key
                         )
-                        running = callback_key in self._hook_running_callbacks
+                        running = (
+                            gate_key in self._hook_running_callbacks
+                            or bool(self._hook_abandoned.get(suppression_key))
+                        )
                         if (
                             suppressed_until is not None and suppressed_until > now
                         ) or running:
@@ -5488,18 +5509,31 @@ class PluginManager:
                                 results.append(_pre_tool_call_timeout_block())
                             continue
                         if suppressed_until is not None:
-                            self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        self._hook_running_callbacks[callback_key] = token
+                            self._hook_timeout_suppressed_until.pop(suppression_key, None)
+                        self._hook_running_callbacks[gate_key] = token
 
                     context = contextvars.copy_context()
                     done = threading.Event()
                     outcome: Dict[str, Any] = {}
                     failure: Dict[str, Exception] = {}
 
+                    def _release_token(
+                        _skey: tuple = suppression_key,
+                        _gkey: tuple = gate_key,
+                        _token: object = token,
+                    ) -> None:
+                        with self._hook_timeout_lock:
+                            if self._hook_running_callbacks.get(_gkey) is _token:
+                                self._hook_running_callbacks.pop(_gkey, None)
+                                abandoned = self._hook_abandoned.get(_skey)
+                                if abandoned is not None:
+                                    abandoned.discard(_gkey)
+                                    if not abandoned:
+                                        self._hook_abandoned.pop(_skey, None)
+
                     def _runner(
                         _cb: Callable[..., Any] = cb,
-                        _key: tuple = callback_key,
-                        _token: object = token,
+                        _release: Callable[[], None] = _release_token,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
@@ -5511,9 +5545,7 @@ class PluginManager:
                         except Exception as exc:
                             failure["exc"] = exc
                         finally:
-                            with self._hook_timeout_lock:
-                                if self._hook_running_callbacks.get(_key) is _token:
-                                    self._hook_running_callbacks.pop(_key, None)
+                            _release()
                             done.set()
 
                     thread = threading.Thread(
@@ -5521,14 +5553,30 @@ class PluginManager:
                         name=f"hermes-hook-{callback_name}"[:40],
                         daemon=True,
                     )
-                    thread.start()
+                    try:
+                        thread.start()
+                    except RuntimeError as exc:
+                        _release_token()
+                        logger.warning(
+                            "Hook '%s' callback %s worker failed to start: %s — skipping",
+                            hook_name,
+                            callback_name,
+                            exc,
+                        )
+                        if fail_closed:
+                            results.append(_pre_tool_call_timeout_block())
+                        continue
                     if not done.wait(timeout=timeout):
                         # Do not join — that would reintroduce the #6622 hang.
                         with self._hook_timeout_lock:
-                            self._hook_timeout_suppressed_until[callback_key] = (
+                            self._hook_timeout_suppressed_until[suppression_key] = (
                                 time.monotonic()
                                 + self._hook_timeout_suppression_seconds
                             )
+                            if self._hook_running_callbacks.get(gate_key) is token:
+                                self._hook_abandoned.setdefault(
+                                    suppression_key, set()
+                                ).add(gate_key)
                         logger.warning(
                             "Hook '%s' callback %s timed out after %gs — skipping",
                             hook_name,
