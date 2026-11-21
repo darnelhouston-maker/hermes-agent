@@ -885,6 +885,24 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    if not session_id or not turn_id:
+        try:
+            from tools.approval_context import _approval_session_id, _approval_turn_id
+            if not turn_id:
+                turn_id = _approval_turn_id.get() or None
+            if not session_id:
+                session_id = _approval_session_id.get() or None
+        except Exception:
+            pass
+    if not session_id:
+        try:
+            from gateway.session_context import get_session_env
+            session_id = get_session_env("HERMES_SESSION_ID", "") or None
+        except Exception:
+            pass
+    if not tool_call_id:
+        import uuid as _uuid
+        tool_call_id = f"nested_{_uuid.uuid4().hex[:16]}"
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 
