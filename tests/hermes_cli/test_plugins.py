@@ -1526,6 +1526,57 @@ class TestForceReloadSymmetry:
 
         assert len(starts) == 2
 
+    def test_nested_handle_function_call_without_tool_call_id_concurrent_pre_tool_call(self, monkeypatch):
+        """Concurrent nested execute_code -> hermes_tools.<tool> calls without explicit tool_call_id
+        allocate distinct correlation IDs and do not fail closed with a false pre_tool_call timeout."""
+        import time
+        from model_tools import handle_function_call
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        seen_ids = []
+
+        def slow_policy(**kwargs):
+            seen_ids.append(kwargs.get("tool_call_id"))
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [slow_policy]
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = json.dumps({"output": "ok", "exit_code": 0})
+
+        results = {}
+
+        def invoke_nested(label, task_id):
+            results[label] = handle_function_call(
+                "terminal",
+                {"command": "echo ok"},
+                task_id=task_id,
+            )
+
+        with patch("model_tools.registry", mock_registry):
+            t1 = threading.Thread(target=invoke_nested, args=("c1", "task-1"), daemon=True)
+            t2 = threading.Thread(target=invoke_nested, args=("c2", "task-2"), daemon=True)
+            t1.start()
+            time.sleep(0.05)
+            t2.start()
+            time.sleep(0.15)
+            hold.set()
+            t1.join(5.0)
+            t2.join(5.0)
+
+        assert len(seen_ids) == 2
+        assert seen_ids[0] and seen_ids[1] and seen_ids[0] != seen_ids[1]
+        assert json.loads(results["c1"]) == {"output": "ok", "exit_code": 0}
+        assert json.loads(results["c2"]) == {"output": "ok", "exit_code": 0}
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow."""
         import time
