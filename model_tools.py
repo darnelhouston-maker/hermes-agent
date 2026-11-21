@@ -1236,6 +1236,28 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    if not session_id or not turn_id:
+        try:
+            from tools.approval import (
+                _approval_session_id,
+                _approval_turn_id,
+            )
+            if not turn_id:
+                turn_id = _approval_turn_id.get() or None
+            if not session_id:
+                session_id = _approval_session_id.get() or None
+        except Exception:
+            pass
+    if not session_id:
+        try:
+            from gateway.session_context import get_session_env
+            session_id = get_session_env("HERMES_SESSION_ID", "") or None
+        except Exception:
+            pass
+    if not tool_call_id:
+        import uuid as _uuid
+        tool_call_id = f"nested_{_uuid.uuid4().hex[:16]}"
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

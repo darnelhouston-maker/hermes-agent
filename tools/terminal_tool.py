@@ -3668,6 +3668,7 @@ def terminal_tool(
             # The hook is fail-open, and the first valid string return wins.
             try:
                 from hermes_cli.lifecycle import invoke_hook
+                from tools.approval import _approval_tool_call_id
                 hook_results = invoke_hook(
                     "transform_terminal_output",
                     command=command,
@@ -3675,6 +3676,7 @@ def terminal_tool(
                     returncode=returncode,
                     task_id=effective_task_id or "",
                     env_type=env_type,
+                    tool_call_id=_approval_tool_call_id.get(),
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
